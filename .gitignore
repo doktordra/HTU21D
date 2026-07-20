@@ -1,0 +1,6 @@
+*.bin
+build/
+*.elf
+*.map
+*.partitions.bin
+*.bootloader.bin
