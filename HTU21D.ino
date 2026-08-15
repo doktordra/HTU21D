@@ -4,14 +4,16 @@
 #include <WebOTA.h>
 #include <WebServer.h>
 #include <Adafruit_AHTX0.h>
+#include <Preferences.h>
 #include <stdarg.h>
 
-#define AHT_SDA_PIN 15
-#define AHT_SCL_PIN 2
+#define AHT_SDA_PIN 22
+#define AHT_SCL_PIN 19
 
 #define BQ_SDA 33
 #define BQ_SCL 13
 #define BQ25895_ADDRESS 0x6A
+#define ENABLE_BQ 0
 
 #define SERVICE_UUID              "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID       "beb5483e-36e1-4688-b7f5-ea07361b26a8"
@@ -36,12 +38,37 @@ uint16_t i2cTimeoutMs = 50;
 uint16_t bqAdcDelayMs = 120;
 
 bool ahtPresent = false;
+bool ahtReadingValid = false;
 bool bqPresent = false;
 bool bqReadHealthy = true;
 
 String debugBuffer = "";
 const size_t DEBUG_BUFFER_MAX = 4096;
 WebServer debugServer(8081);
+Preferences snapshotPreferences;
+
+const uint8_t MAX_SNAPSHOTS = 24;
+const uint32_t SNAPSHOT_MAGIC = 0x534E4150;
+
+struct Snapshot {
+  uint32_t id;
+  char capturedAt[32];
+  float temperature;
+  float humidity;
+  double latitude;
+  double longitude;
+  bool hasLocation;
+  char comment[96];
+};
+
+struct SnapshotStore {
+  uint32_t magic;
+  uint32_t nextId;
+  uint8_t count;
+  Snapshot items[MAX_SNAPSHOTS];
+};
+
+SnapshotStore snapshotStore = {};
 
 float lastTemperature = 0.0f;
 float lastHumidity = 0.0f;
@@ -56,6 +83,12 @@ void handleDebugRoot();
 void handleDebugLogs();
 void handleDebugStatus();
 void handleDebugSet();
+void handleSnapshots();
+void handleSnapshotCreate();
+void handleSnapshotComment();
+void loadSnapshots();
+void saveSnapshots();
+void appendJsonString(String &json, const char *value);
 
 bool probeI2C(TwoWire &bus, uint8_t addr);
 bool initAHT();
@@ -69,13 +102,18 @@ float getBatteryVoltage();
 void dumpBQRegisters();
 
 void debugLogf(const char* fmt, ...) {
-  char buf[180];
+  char message[180];
   va_list args;
   va_start(args, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, args);
+  vsnprintf(message, sizeof(message), fmt, args);
   va_end(args);
 
-  String line = String(buf);
+  char lineBuffer[220];
+  snprintf(lineBuffer, sizeof(lineBuffer), "[%10lu ms] %s", millis(), message);
+  String line = String(lineBuffer);
+
+  Serial.println(line);
+
   debugBuffer += line + "\n";
   if (debugBuffer.length() > DEBUG_BUFFER_MAX) {
     debugBuffer = debugBuffer.substring(debugBuffer.length() - DEBUG_BUFFER_MAX);
@@ -151,6 +189,7 @@ bool initAHT() {
 
   if (!aht.begin(&Wire1)) {
     ahtPresent = false;
+    ahtReadingValid = false;
     debugLogf("AHTX0 nije pronadjen (SDA=%d SCL=%d).", AHT_SDA_PIN, AHT_SCL_PIN);
     return false;
   }
@@ -300,36 +339,42 @@ void setupDebugHttpServer() {
   debugServer.on("/logs", HTTP_GET, handleDebugLogs);
   debugServer.on("/status", HTTP_GET, handleDebugStatus);
   debugServer.on("/set", HTTP_GET, handleDebugSet);
+  debugServer.on("/snapshots", HTTP_GET, handleSnapshots);
+  debugServer.on("/snapshot", HTTP_POST, handleSnapshotCreate);
+  debugServer.on("/snapshot/comment", HTTP_POST, handleSnapshotComment);
   debugServer.begin();
   debugHttpServerActive = true;
 }
 
 void handleDebugRoot() {
   String html;
-  html.reserve(2600);
+  html.reserve(6200);
   html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>VoiceToysWS Debug</title><style>body{font-family:monospace;background:#0b1020;color:#dce3ff;padding:16px;}";
-  html += "h1{font-size:18px;margin:0 0 12px;}fieldset{border:1px solid #3a4466;margin:0 0 10px;padding:10px;}";
-  html += "label{display:block;margin:6px 0;}input{width:120px;}button{padding:6px 10px;margin-top:6px;}";
-  html += "pre{background:#111830;border:1px solid #2b3559;padding:10px;max-height:45vh;overflow:auto;white-space:pre-wrap;}";
-  html += "small{color:#a9b5e5;}</style></head><body>";
-  html += "<h1>VoiceToysWS Debug Panel</h1>";
-  html += "<small>OTA upload je na /webota, debug je ovde.</small>";
-  html += "<fieldset><legend>Parametri (runtime)</legend>";
-  html += "<label>intervalCitanjaMs <input id='interval' type='number' min='300' max='60000'></label>";
-  html += "<label>i2cTimeoutMs <input id='i2c' type='number' min='10' max='500'></label>";
-  html += "<label>bqAdcDelayMs <input id='bq' type='number' min='20' max='1000'></label>";
-  html += "<button onclick='apply()'>Primeni</button>";
-  html += "<button onclick='reinitAht()'>Reinit AHT</button></fieldset>";
-  html += "<pre id='status'>status...</pre><pre id='logs'>logs...</pre>";
+  html += "<title>Klima merenje</title><style>:root{--ink:#17211c;--paper:#f4f1e8;--accent:#087e6a;--line:#c9c7ba}";
+  html += "*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:Georgia,serif}";
+  html += "main{width:min(900px,calc(100% - 32px));margin:32px auto}header{display:flex;justify-content:space-between;align-items:end;border-bottom:2px solid var(--ink);padding-bottom:12px}";
+  html += "h1{font-size:24px;margin:0;letter-spacing:0}.live{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:24px 0}";
+  html += ".metric{border:1px solid var(--line);padding:24px;background:#fff}.value{font:700 48px Georgia,serif}.unit{font-size:18px;color:#59635d}";
+  html += "button{border:0;background:var(--accent);color:#fff;padding:11px 16px;font-weight:700;cursor:pointer}button:disabled{opacity:.5}";
+  html += ".actions{display:flex;gap:12px;align-items:center;margin-bottom:28px}.note{font-size:13px;color:#59635d}";
+  html += "table{width:100%;border-collapse:collapse;background:#fff}th,td{text-align:left;border-bottom:1px solid var(--line);padding:10px;vertical-align:top}th{font-size:12px;text-transform:uppercase}";
+  html += "input{width:100%;min-width:140px;padding:8px;border:1px solid var(--line);font:14px Georgia,serif}.loc{font-size:12px}#message{min-height:20px}";
+  html += "@media(max-width:620px){main{margin:18px auto}.live{grid-template-columns:1fr}.value{font-size:40px}table,thead,tbody,tr,th,td{display:block}thead{display:none}tr{border-bottom:2px solid var(--ink)}td{border:0;padding:6px 10px}}</style></head><body><main>";
+  html += "<header><h1>Klima merenje</h1><span id='sensorState' class='note'>Povezivanje...</span></header>";
+  html += "<section class='live'><div class='metric'><div class='note'>Temperatura</div><span id='temperature' class='value'>--</span><span class='unit'> &deg;C</span></div>";
+  html += "<div class='metric'><div class='note'>Relativna vlaznost</div><span id='humidity' class='value'>--</span><span class='unit'> %</span></div></section>";
+  html += "<div class='actions'><button id='snapshotButton' onclick='captureSnapshot()'>Napravi snapshot</button><span id='message' class='note'></span></div>";
+  html += "<table><thead><tr><th>Vreme</th><th>Temperatura</th><th>Vlaznost</th><th>Lokacija</th><th>Komentar</th></tr></thead><tbody id='snapshots'></tbody></table>";
   html += "<script>";
-  html += "async function refresh(){const s=await fetch('/status').then(r=>r.json());";
-  html += "interval.value=s.intervalCitanjaMs;i2c.value=s.i2cTimeoutMs;bq.value=s.bqAdcDelayMs;";
-  html += "status.textContent=JSON.stringify(s,null,2);logs.textContent=await fetch('/logs').then(r=>r.text());}";
-  html += "async function apply(){await fetch('/set?interval='+interval.value+'&i2c='+i2c.value+'&bq='+bq.value);await refresh();}";
-  html += "async function reinitAht(){await fetch('/set?aht_reinit=1');await refresh();}";
-  html += "setInterval(refresh,1500);refresh();";
-  html += "</script></body></html>";
+  html += "let live=null;async function refresh(){try{live=await fetch('/status').then(r=>r.json());temperature.textContent=live.ahtReadingValid?live.lastTemperature.toFixed(2):'--';humidity.textContent=live.ahtReadingValid?live.lastHumidity.toFixed(2):'--';sensorState.textContent=live.ahtReadingValid?'Senzor je aktivan':(live.ahtPresent?'Ceka se prvo merenje':'Senzor nije pronadjen');}catch(e){sensorState.textContent='Nema veze sa uredjajem';}}";
+  html += "function esc(v){const d=document.createElement('div');d.textContent=v||'';return d.innerHTML}";
+  html += "function escAttr(v){return esc(v).replace(/'/g,'&#39;')}";
+  html += "async function loadSnapshots(){const list=await fetch('/snapshots').then(r=>r.json());snapshots.innerHTML=list.map(s=>`<tr><td>${esc(new Date(s.capturedAt).toLocaleString())}</td><td>${s.temperature.toFixed(2)} &deg;C</td><td>${s.humidity.toFixed(2)} %</td><td class='loc'>${s.hasLocation?`${s.latitude.toFixed(5)}, ${s.longitude.toFixed(5)}`:'Nije dostupna'}</td><td><input maxlength='95' value='${escAttr(s.comment)}' onchange='saveComment(${s.id},this.value)'></td></tr>`).join('');}";
+  html += "function getLocation(){return new Promise(resolve=>{if(!navigator.geolocation)return resolve(null);navigator.geolocation.getCurrentPosition(p=>resolve(p.coords),()=>resolve(null),{enableHighAccuracy:false,timeout:5000,maximumAge:60000});});}";
+  html += "async function captureSnapshot(){snapshotButton.disabled=true;message.textContent='Cuvam...';await refresh();if(!live||!live.ahtReadingValid){message.textContent='Nema ispravnog ocitavanja.';snapshotButton.disabled=false;return;}const loc=await getLocation();const p=new URLSearchParams({capturedAt:new Date().toISOString()});if(loc){p.set('lat',loc.latitude);p.set('lon',loc.longitude)}const r=await fetch('/snapshot',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});message.textContent=r.ok?'Snapshot je sacuvan.':'Cuvanje nije uspelo.';snapshotButton.disabled=false;await loadSnapshots();}";
+  html += "async function saveComment(id,comment){const p=new URLSearchParams({id,comment});await fetch('/snapshot/comment',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});message.textContent='Komentar je sacuvan.';}";
+  html += "setInterval(refresh,2000);refresh();loadSnapshots();";
+  html += "</script></main></body></html>";
   debugServer.send(200, "text/html", html);
 }
 
@@ -340,8 +385,9 @@ void handleDebugLogs() {
 void handleDebugStatus() {
   char json[320];
   snprintf(json, sizeof(json),
-           "{\"ahtPresent\":%s,\"bqPresent\":%s,\"bqReadHealthy\":%s,\"lastTemperature\":%.2f,\"lastHumidity\":%.2f,\"lastBatteryV\":%.2f,\"intervalCitanjaMs\":%lu,\"i2cTimeoutMs\":%u,\"bqAdcDelayMs\":%u}",
+           "{\"ahtPresent\":%s,\"ahtReadingValid\":%s,\"bqPresent\":%s,\"bqReadHealthy\":%s,\"lastTemperature\":%.2f,\"lastHumidity\":%.2f,\"lastBatteryV\":%.2f,\"intervalCitanjaMs\":%lu,\"i2cTimeoutMs\":%u,\"bqAdcDelayMs\":%u}",
            ahtPresent ? "true" : "false",
+           ahtReadingValid ? "true" : "false",
            bqPresent ? "true" : "false",
            bqReadHealthy ? "true" : "false",
            lastTemperature,
@@ -351,6 +397,99 @@ void handleDebugStatus() {
            i2cTimeoutMs,
            bqAdcDelayMs);
   debugServer.send(200, "application/json", json);
+}
+
+void appendJsonString(String &json, const char *value) {
+  json += '"';
+  while (*value) {
+    char c = *value++;
+    if (c == '"' || c == '\\') {
+      json += '\\';
+    }
+    if (c == '\n' || c == '\r') {
+      json += ' ';
+    } else {
+      json += c;
+    }
+  }
+  json += '"';
+}
+
+void loadSnapshots() {
+  snapshotPreferences.begin("climate", false);
+  size_t storedSize = snapshotPreferences.getBytesLength("snapshots");
+  if (storedSize == sizeof(snapshotStore)) {
+    snapshotPreferences.getBytes("snapshots", &snapshotStore, sizeof(snapshotStore));
+  }
+  if (snapshotStore.magic != SNAPSHOT_MAGIC || snapshotStore.count > MAX_SNAPSHOTS) {
+    memset(&snapshotStore, 0, sizeof(snapshotStore));
+    snapshotStore.magic = SNAPSHOT_MAGIC;
+    snapshotStore.nextId = 1;
+  }
+}
+
+void saveSnapshots() {
+  snapshotPreferences.putBytes("snapshots", &snapshotStore, sizeof(snapshotStore));
+}
+
+void handleSnapshots() {
+  String json = "[";
+  json.reserve(512 + snapshotStore.count * 180);
+  for (int i = snapshotStore.count - 1; i >= 0; i--) {
+    Snapshot &item = snapshotStore.items[i];
+    if (i != snapshotStore.count - 1) json += ',';
+    json += "{\"id\":" + String(item.id) + ",\"capturedAt\":";
+    appendJsonString(json, item.capturedAt);
+    json += ",\"temperature\":" + String(item.temperature, 2);
+    json += ",\"humidity\":" + String(item.humidity, 2);
+    json += ",\"hasLocation\":" + String(item.hasLocation ? "true" : "false");
+    json += ",\"latitude\":" + String(item.latitude, 6);
+    json += ",\"longitude\":" + String(item.longitude, 6) + ",\"comment\":";
+    appendJsonString(json, item.comment);
+    json += '}';
+  }
+  json += ']';
+  debugServer.send(200, "application/json", json);
+}
+
+void handleSnapshotCreate() {
+  if (!ahtReadingValid || debugServer.arg("capturedAt").length() < 10) {
+    debugServer.send(400, "text/plain", "Nema merenja ili vremena");
+    return;
+  }
+
+  if (snapshotStore.count == MAX_SNAPSHOTS) {
+    memmove(&snapshotStore.items[0], &snapshotStore.items[1], sizeof(Snapshot) * (MAX_SNAPSHOTS - 1));
+    snapshotStore.count--;
+  }
+
+  Snapshot &item = snapshotStore.items[snapshotStore.count++];
+  memset(&item, 0, sizeof(item));
+  item.id = snapshotStore.nextId++;
+  item.temperature = lastTemperature;
+  item.humidity = lastHumidity;
+  strlcpy(item.capturedAt, debugServer.arg("capturedAt").c_str(), sizeof(item.capturedAt));
+  if (debugServer.hasArg("lat") && debugServer.hasArg("lon")) {
+    item.latitude = debugServer.arg("lat").toDouble();
+    item.longitude = debugServer.arg("lon").toDouble();
+    item.hasLocation = true;
+  }
+  saveSnapshots();
+  debugLogf("Snapshot %lu: T=%.2f H=%.2f", item.id, item.temperature, item.humidity);
+  debugServer.send(201, "text/plain", "OK");
+}
+
+void handleSnapshotComment() {
+  uint32_t id = (uint32_t)debugServer.arg("id").toInt();
+  for (uint8_t i = 0; i < snapshotStore.count; i++) {
+    if (snapshotStore.items[i].id == id) {
+      strlcpy(snapshotStore.items[i].comment, debugServer.arg("comment").c_str(), sizeof(snapshotStore.items[i].comment));
+      saveSnapshots();
+      debugServer.send(200, "text/plain", "OK");
+      return;
+    }
+  }
+  debugServer.send(404, "text/plain", "Snapshot nije pronadjen");
 }
 
 void handleDebugSet() {
@@ -379,9 +518,17 @@ void handleDebugSet() {
 }
 
 void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println();
+  Serial.println("==================================================");
+  debugLogf("BOOT: VoiceToysWS pokrenut; Serial=115200 baud.");
+
   setCpuFrequencyMhz(80);
   WiFi.mode(WIFI_OFF);
+  debugLogf("SISTEM: CPU=80 MHz, WiFi inicijalno iskljucen.");
 
+  debugLogf("BLE: inicijalizacija uredjaja i servisa...");
   NimBLEDevice::init("VoiceToysWS");
   NimBLEServer *pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
@@ -405,12 +552,15 @@ void setup() {
   pAdvertising->setScanResponse(true);
   pAdvertising->start();
 
-  debugLogf("--- VoiceToysWS boot (80MHz) ---");
-  debugLogf("OTA trigger char: '%c'", OTA_TRIGGER_CHAR);
-  debugLogf("BLE aktivan i oglasava se.");
+  debugLogf("BLE: aktivan, naziv=VoiceToysWS, OTA komanda='%c'.", OTA_TRIGGER_CHAR);
 
+  debugLogf("OTA: pokretanje lokalnog WiFi/WebOTA interfejsa...");
   startWebOtaServer();
+  loadSnapshots();
+  debugLogf("Snapshot memorija: %u/%u sacuvano.", snapshotStore.count, MAX_SNAPSHOTS);
 
+#if ENABLE_BQ
+  debugLogf("BQ: pokretanje I2C magistrale (SDA=%d, SCL=%d)...", BQ_SDA, BQ_SCL);
   Wire.begin(BQ_SDA, BQ_SCL);
   Wire.setClock(100000);
   Wire.setTimeOut(i2cTimeoutMs);
@@ -425,17 +575,26 @@ void setup() {
     debugLogf("BQ read status: %s", bqReadHealthy ? "OK" : "FAIL");
     debugLogf("Test VBAT: %.2fV", getBatteryVoltage());
   }
+#else
+  bqPresent = false;
+  debugLogf("BQ: privremeno iskljucen u programu.");
+#endif
 
+  debugLogf("AHT: pokretanje I2C magistrale (SDA=%d, SCL=%d)...", AHT_SDA_PIN, AHT_SCL_PIN);
   initAHT();
   if (ahtPresent) {
     float t = 0.0f;
     float h = 0.0f;
     if (readAHT(t, h)) {
+      lastTemperature = t;
+      lastHumidity = h;
+      ahtReadingValid = true;
       debugLogf("Test AHT: T=%.2f H=%.2f", t, h);
     }
   }
 
-  debugLogf("Uredjaj spreman, cekam konekciju.");
+  debugLogf("READY: inicijalizacija zavrsena; telemetrija na svakih %lu ms.", intervalCitanjaMs);
+  Serial.println("==================================================");
 }
 
 void loop() {
@@ -459,14 +618,22 @@ void loop() {
     bool ahtOk = readAHT(temperature, humidity);
 
     if (!ahtOk) {
+      ahtReadingValid = false;
       if (millis() - lastAhtProbeMs >= 5000) {
         lastAhtProbeMs = millis();
         initAHT();
       }
       debugLogf("AHT citanje neuspesno.");
+    } else {
+      ahtReadingValid = true;
+      Serial.printf("Temperatura: %.2f C | Vlaznost: %.2f %%\n", temperature, humidity);
     }
 
+#if ENABLE_BQ
     float vbat = bqPresent ? getBatteryVoltage() : 0.0f;
+#else
+    float vbat = 0.0f;
+#endif
 
     if (ahtOk) {
       lastTemperature = temperature;

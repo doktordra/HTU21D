@@ -1,11 +1,19 @@
-# HTU21D BLE WebOTA
+# AHT BLE WebOTA
 
-Arduino sketch for an ESP32-based HTU21D sensor node with BLE telemetry, battery voltage reporting, and BLE-triggered WebOTA updates.
+Arduino sketch for an ESP32-based temperature and humidity sensor node with BLE telemetry, serial output, persistent snapshots, and WebOTA updates.
 
 ## Hardware
 
-- HTU-21D on I2C: SDA `15`, SCL `2`
-- BQ25895 on second I2C bus: SDA `33`, SCL `13`
+- AHT sensor on I2C: SDA `22`, SCL `19`
+- BQ25895 support is temporarily disabled with `ENABLE_BQ 0`
+
+## Measurements and snapshots
+
+- Serial output runs at `115200` baud and prints temperature and relative humidity every three seconds.
+- Connect to the `VoiceToysWS-OTA` Wi-Fi network and open `http://192.168.4.1:8081/`.
+- The page shows live temperature and humidity and can save up to 24 snapshots in ESP32 non-volatile storage.
+- Each snapshot stores browser time and an editable comment.
+- Browser location is stored when the browser exposes geolocation and the user grants permission; otherwise the snapshot is saved without it.
 
 ## BLE
 
@@ -15,7 +23,7 @@ Arduino sketch for an ESP32-based HTU21D sensor node with BLE telemetry, battery
 
 The characteristic:
 
-- sends notifications with ASCII payload like `T:24.10,H:51.20,V:4.02V`
+- sends notifications with ASCII payload like `T:24.10,H:51.20,V:0.00V` while BQ support is disabled
 - accepts BLE writes
 - starts OTA mode when it receives ASCII character `U`
 
@@ -35,4 +43,5 @@ The characteristic:
 ## Notes
 
 - Wi-Fi stays off until OTA is triggered over BLE.
+- USB Serial debug output includes a millisecond timestamp.
 - Build artifacts are ignored by Git.
