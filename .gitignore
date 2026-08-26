@@ -4,3 +4,4 @@ build/
 *.map
 *.partitions.bin
 *.bootloader.bin
+.DS_Store
