@@ -18,7 +18,10 @@ Arduino sketch for an ESP32-based temperature and humidity sensor node with BLE 
 - Up to five networks are stored in ESP32 NVS. At boot, the station selects the strongest available known network.
 - If no known network is available, the station opens its `VoiceToysWS-OTA` fallback AP and retries known networks once per minute.
 - The page shows temperature, relative humidity, calculated RealFeel, and absolute humidity with smoothed trends and min/max values.
-- Graphs share a selectable range from one minute to 24 hours.
+- Graphs share a dual-thumb timeline showing the complete recorded interval; move either end to select the displayed time window.
+- When internet access is available, the ESP32 synchronizes through NTP and stores Unix timestamps. The browser displays them in the phone/computer local time zone; without NTP, elapsed uptime is shown.
+- Touch or hover over any graph to place one synchronized vertical cursor across all four graphs and show the exact time and values.
+- Each metric shows the interval maximum, signed first-to-last change, and interval minimum beside its trend arrow.
 - The latest 10 minutes are kept at 500 ms resolution in RAM. One-second samples are retained for 24 hours in a circular SPIFFS file and written in one-minute batches.
 - The page can save up to 24 snapshots in ESP32 non-volatile storage.
 - Snapshot capture first creates a preview; a separate save action commits the displayed values.

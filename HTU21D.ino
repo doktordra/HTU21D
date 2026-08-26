@@ -9,6 +9,7 @@
 #include <ESPmDNS.h>
 #include <Adafruit_NeoPixel.h>
 #include <stdarg.h>
+#include <time.h>
 
 #define AHT_SDA_PIN 1
 #define AHT_SCL_PIN 3
@@ -79,6 +80,7 @@ bool bqPresent = false;
 bool bqReadHealthy = true;
 bool diagnosticLedsEnabled = true;
 bool diagnosticLedsLit = false;
+bool clockWasValid = false;
 
 String debugBuffer = "";
 const size_t DEBUG_BUFFER_MAX = 4096;
@@ -143,7 +145,7 @@ uint16_t historyHead = 0;
 // Poslednjih 10 minuta ostaje u RAM-u na punih 500 ms.
 // Flash se ne pise svake sekunde: 60 tacaka se upisuje odjednom na minut.
 const uint32_t PERSISTENT_HISTORY_MAGIC = 0x434C494D;
-const uint16_t PERSISTENT_HISTORY_VERSION = 3;
+const uint16_t PERSISTENT_HISTORY_VERSION = 4;
 const uint32_t PERSISTENT_HISTORY_CAPACITY = 24UL * 60UL * 60UL;
 const uint16_t PERSISTENT_BATCH_SIZE = 60;
 const char PERSISTENT_HISTORY_PATH[] = "/climate-history.bin";
@@ -200,6 +202,9 @@ bool connectKnownNetwork();
 void startFallbackAp();
 void configureNetwork();
 void startNetworkDiscovery();
+bool isClockValid();
+uint32_t currentSampleTimestamp();
+void updateClockState();
 void appendJsonString(String &json, const char *value);
 
 bool probeI2C(TwoWire &bus, uint8_t addr);
@@ -233,6 +238,28 @@ float calculateRealFeel(float temperature, float humidity) {
   // Steadman apparent temperature without wind/radiation input.
   float vaporHpa = (humidity / 100.0f) * 6.105f * expf((17.27f * temperature) / (237.7f + temperature));
   return temperature + 0.33f * vaporHpa - 4.0f;
+}
+
+bool isClockValid() {
+  return time(nullptr) >= 1700000000;
+}
+
+uint32_t currentSampleTimestamp() {
+  time_t now = time(nullptr);
+  return now >= 1700000000 ? (uint32_t)now : millis() / 1000;
+}
+
+void updateClockState() {
+  bool valid = isClockValid();
+  if (valid && !clockWasValid) {
+    // Odbaci samo kratke uptime uzorke iz tekuceg boota; sacuvana epoch istorija ostaje.
+    historyCount = 0;
+    historyHead = 0;
+    persistentBatchCount = 0;
+    persistentBatchStartMs = millis();
+    debugLogf("Vreme: NTP sinhronizovan, istorija sada koristi Unix vreme.");
+  }
+  clockWasValid = valid;
 }
 
 bool initPersistentHistory() {
@@ -309,7 +336,7 @@ bool flushPersistentHistoryBatch() {
 }
 
 void accumulatePersistentHistory(float temperature, float humidity, float realFeel, float absoluteHumidity) {
-  if (!persistentHistoryReady) return;
+  if (!persistentHistoryReady || !isClockValid()) return;
 
   unsigned long now = millis();
   if (lastPersistentSampleMs != 0 && now - lastPersistentSampleMs < 1000) return;
@@ -321,7 +348,7 @@ void accumulatePersistentHistory(float temperature, float humidity, float realFe
   }
 
   PersistentHistoryPoint &point = persistentBatch[persistentBatchCount++];
-  point.sequence = persistentHistory.sequence + persistentBatchCount;
+  point.sequence = currentSampleTimestamp();
   point.temperature100 = (int16_t)roundf(temperature * 100.0f);
   point.humidity100 = (int16_t)roundf(humidity * 100.0f);
   point.realFeel100 = (int16_t)roundf(realFeel * 100.0f);
@@ -385,7 +412,7 @@ void updateClimateMetrics(float temperature, float humidity) {
                               smoothedRealFeel, smoothedAbsoluteHumidity);
 
   HistoryPoint &point = historyPoints[historyHead];
-  point.seconds = now / 1000;
+  point.seconds = currentSampleTimestamp();
   point.temperature = smoothedTemperature;
   point.humidity = smoothedHumidity;
   point.realFeel = smoothedRealFeel;
@@ -764,6 +791,10 @@ void startNetworkDiscovery() {
   } else {
     debugLogf("WiFi: mDNS ime nije pokrenuto; koristi prikazanu IP adresu.");
   }
+  if (WiFi.status() == WL_CONNECTED) {
+    configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+    debugLogf("Vreme: NTP sinhronizacija pokrenuta.");
+  }
 }
 
 void startWebOtaServer() {
@@ -821,19 +852,19 @@ void handleDebugRoot() {
   html += "main{width:min(900px,calc(100% - 24px));margin:24px auto}header{display:flex;justify-content:space-between;align-items:end;border-bottom:2px solid var(--ink);padding-bottom:12px;gap:10px}";
   html += "h1{font-size:24px;margin:0}.tabs,.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.tabs{margin:14px 0}.tab{background:#d9d8ce;color:var(--ink)}.tab.active{background:var(--accent);color:#fff}.view{display:none}.view.active{display:block}";
   html += ".live{display:grid;gap:12px;margin:14px 0 22px}.metric{display:grid;grid-template-columns:minmax(200px,29%) 116px 1fr;align-items:center;gap:14px;position:relative;border:1px solid var(--line);padding:16px;background:#fff;min-height:148px}.reading{align-self:center}.metricName{font-size:17px;font-weight:700;color:#445149;margin-bottom:4px}.value{font:700 clamp(34px,6vw,50px) Georgia,serif}.unit{font-size:17px;color:#59635d}";
-  html += ".trendBox{display:grid;grid-template-columns:66px 44px;align-items:center;justify-content:center;gap:6px;min-width:116px}.trendVisual{display:grid;grid-template-rows:82px auto;justify-items:center;align-items:center}.rangeStack{height:92px;display:flex;flex-direction:column;justify-content:space-between;align-items:flex-start}.rangeLabel{font:700 15px Arial,sans-serif;color:#3f4d45;white-space:nowrap}.rangeLabel:before{display:block;font-size:9px;font-weight:600;color:#7b847f;text-transform:uppercase}.rangeMax:before{content:'max'}.rangeMin:before{content:'min'}.metric .rate{font:700 13px Arial,sans-serif;color:#45524a;white-space:nowrap;text-align:center;margin-top:2px}.trend{position:relative;width:34px;height:78px;color:var(--flat);transform:rotate(0deg);transition:transform .45s cubic-bezier(.2,.8,.2,1),color .35s ease}.trend .shaft{position:absolute;left:15px;bottom:9px;width:4px;height:var(--len,0px);max-height:56px;background:currentColor;border-radius:4px;transition:height .55s cubic-bezier(.2,.8,.2,1)}.trend .shaft:before{content:'';position:absolute;left:-5px;top:-3px;border-left:7px solid transparent;border-right:7px solid transparent;border-bottom:10px solid currentColor;transform:translateY(-7px)}.trend.down{color:var(--down);transform:rotate(180deg)}.trend.up{color:var(--up)}.trend.flat{color:var(--flat);transform:rotate(90deg)}.trend.flat .shaft{height:25px!important}.trend.flat .shaft:before{display:block}.chart{min-width:0}.chart canvas{display:block;width:100%;height:112px}";
+  html += ".trendBox{display:grid;grid-template-columns:94px 62px;align-items:center;justify-content:center;gap:8px;min-width:164px}.trendVisual{display:grid;grid-template-rows:82px auto;justify-items:center;align-items:center}.rangeStack{height:112px;display:flex;flex-direction:column;justify-content:space-between;align-items:flex-start}.rangeLabel{font:700 20px Arial,sans-serif;color:#35443c;white-space:nowrap}.rangeDelta{font-size:16px;color:#59665f}.rangeDelta.up{color:var(--up)}.rangeDelta.down{color:var(--down)}.metric .rate{font:700 14px Arial,sans-serif;color:#45524a;white-space:nowrap;text-align:center;margin-top:3px}.trend{position:relative;width:34px;height:78px;color:var(--flat);transform:rotate(0deg);transition:transform .45s cubic-bezier(.2,.8,.2,1),color .35s ease}.trend .shaft{position:absolute;left:15px;bottom:9px;width:4px;height:var(--len,0px);max-height:56px;background:currentColor;border-radius:4px;transition:height .55s cubic-bezier(.2,.8,.2,1)}.trend .shaft:before{content:'';position:absolute;left:-5px;top:-3px;border-left:7px solid transparent;border-right:7px solid transparent;border-bottom:10px solid currentColor;transform:translateY(-7px)}.trend.down{color:var(--down);transform:rotate(180deg)}.trend.up{color:var(--up)}.trend.flat{color:var(--flat);transform:rotate(90deg)}.trend.flat .shaft{height:25px!important}.trend.flat .shaft:before{display:block}.chart{min-width:0}.chart canvas{display:block;width:100%;height:112px;touch-action:none}";
   html += "button{border:0;background:var(--accent);color:#fff;padding:11px 16px;font-weight:700;cursor:pointer}button:disabled{opacity:.5}.update{background:#263d70}.actions{margin:12px 0 22px}.note{font-size:13px;color:#59635d}";
-  html += ".controls{display:flex;align-items:center;gap:8px;margin:8px 0;font-size:13px}.controls select{padding:7px;background:#fff;border:1px solid var(--line)}.snapshotReading{min-height:16px;margin-top:5px;color:#8a6320;font:12px Arial,sans-serif}.save{background:#9b6516}.hidden{display:none!important}.deleteHint{color:#8e4038}.snapshotRow{touch-action:manipulation}";
+  html += ".timeline{background:#fff;border:1px solid var(--line);padding:14px 18px;margin:10px 0 14px}.timelineTrack{position:relative;height:28px;margin:2px 5px}.timelineRail,.timelineFill{position:absolute;left:0;right:0;top:12px;height:5px;border-radius:5px;background:#d4d5cf}.timelineFill{right:auto;background:var(--accent)}.timeline input[type=range]{position:absolute;left:0;top:0;width:100%;height:28px;margin:0;padding:0;border:0;background:transparent;pointer-events:none;appearance:none}.timeline input[type=range]::-webkit-slider-thumb{appearance:none;width:22px;height:22px;border-radius:50%;background:#fff;border:4px solid var(--accent);box-shadow:0 1px 4px #0005;pointer-events:auto;cursor:grab}.timeline input[type=range]::-moz-range-thumb{width:15px;height:15px;border-radius:50%;background:#fff;border:4px solid var(--accent);box-shadow:0 1px 4px #0005;pointer-events:auto;cursor:grab}.timelineLabels{display:flex;justify-content:space-between;gap:10px;font:12px Arial,sans-serif;color:#59635d}.selectedRange{text-align:center;font:700 14px Arial,sans-serif;color:var(--ink);margin-top:5px}.cursorInfo{min-height:42px;background:#e7eee9;border-left:4px solid var(--accent);padding:7px 10px;margin-bottom:10px;font:700 13px Arial,sans-serif;color:#33423a}.snapshotReading{min-height:16px;margin-top:5px;color:#8a6320;font:12px Arial,sans-serif}.save{background:#9b6516}.hidden{display:none!important}.deleteHint{color:#8e4038}.snapshotRow{touch-action:manipulation}";
   html += "table{width:100%;border-collapse:collapse;background:#fff}th,td{text-align:left;border-bottom:1px solid var(--line);padding:10px;vertical-align:top}th{font-size:12px;text-transform:uppercase}";
   html += "input,select{width:100%;min-width:140px;padding:8px;border:1px solid var(--line);font:14px Georgia,serif}.networkCard{background:#fff;border:1px solid var(--line);padding:16px;margin:12px 0}.networkCard h2{font-size:18px;margin:0 0 10px}.networkForm{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:end}.networkList{display:grid;gap:7px;margin-top:10px}.networkItem{display:flex;justify-content:space-between;align-items:center;gap:8px;border-bottom:1px solid var(--line);padding:7px 0}.danger{background:#9d332c}.address{font-family:Arial,sans-serif;font-weight:700;word-break:break-all}.debugGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.debugValue{font:700 20px Arial,sans-serif}.ok{color:var(--up)}.bad{color:var(--down)}.switchLine{display:flex;align-items:center;gap:10px}.switchLine input{width:auto;min-width:0}#debugLogs{display:block;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto;background:#18201c;color:#dce8df;padding:12px;font:11px monospace}#message,#networkMessage,#debugMessage{min-height:20px}";
-  html += "@media(max-width:620px){main{margin:12px auto}.metric{grid-template-columns:minmax(0,1fr) 116px;padding:14px 12px;gap:10px;min-height:0}.metricName{font-size:16px}.value{font-size:38px}.unit{font-size:15px}.trendBox{grid-column:2;grid-row:1}.chart{grid-column:1/-1}.chart canvas{height:104px}header{align-items:start;flex-direction:column}.networkForm{grid-template-columns:1fr}.networkForm button{width:100%}table,thead,tbody,tr,th,td{display:block}thead{display:none}tr{border-bottom:2px solid var(--ink)}td{border:0;padding:6px 10px}}</style></head><body><main>";
+  html += "@media(max-width:620px){main{margin:12px auto}.metric{grid-template-columns:minmax(0,1fr) 164px;padding:14px 12px;gap:8px;min-height:0}.metricName{font-size:16px}.value{font-size:38px}.unit{font-size:15px}.trendBox{grid-column:2;grid-row:1}.chart{grid-column:1/-1}.chart canvas{height:104px}.timeline{padding:12px 10px}.timelineLabels{font-size:10px}.selectedRange{font-size:12px}header{align-items:start;flex-direction:column}.networkForm{grid-template-columns:1fr}.networkForm button{width:100%}table,thead,tbody,tr,th,td{display:block}thead{display:none}tr{border-bottom:2px solid var(--ink)}td{border:0;padding:6px 10px}}</style></head><body><main>";
   html += "<header><h1>VoiceToys Weather Station</h1><span id='sensorState' class='note'>Povezivanje...</span></header>";
   html += "<nav class='tabs'><button id='liveTab' class='tab active' onclick=\"showTab('live')\">Uzivo</button><button id='snapTab' class='tab' onclick=\"showTab('snap')\">Snapshotovi</button><button id='networkTab' class='tab' onclick=\"showTab('network')\">Network</button><button id='debugTab' class='tab' onclick=\"showTab('debug')\">Debug</button></nav>";
-  html += "<section id='liveView' class='view active'><div class='controls'><label for='xRange'>Opseg grafikona:</label><select id='xRange' onchange='refreshCharts()'><option value='60'>zadnji minut (0,5 s)</option><option value='300'>zadnjih 5 minuta (0,5 s)</option><option value='600'>zadnjih 10 minuta (0,5 s)</option><option value='3600'>zadnji sat</option><option value='21600'>zadnjih 6 sati</option><option value='43200'>zadnjih 12 sati</option><option value='86400'>zadnja 24 sata</option></select></div><section class='live'>";
-  html += "<div class='metric'><div class='reading'><div class='metricName'>Temperatura</div><span id='temperature' class='value'>--</span><span class='unit'> &deg;C</span><div id='temperatureSnapshot' class='snapshotReading'></div></div><div class='trendBox'><div class='trendVisual'><div id='temperatureTrend' class='trend flat'><i class='shaft'></i></div><div id='temperatureRate' class='rate'>--</div></div><div class='rangeStack'><span id='temperatureMax' class='rangeLabel rangeMax'>--</span><span id='temperatureMin' class='rangeLabel rangeMin'>--</span></div></div><div class='chart'><canvas id='temperatureChart'></canvas></div></div>";
-  html += "<div class='metric'><div class='reading'><div class='metricName'>Relativna vlaznost</div><span id='humidity' class='value'>--</span><span class='unit'> %</span><div id='humiditySnapshot' class='snapshotReading'></div></div><div class='trendBox'><div class='trendVisual'><div id='humidityTrend' class='trend flat'><i class='shaft'></i></div><div id='humidityRate' class='rate'>--</div></div><div class='rangeStack'><span id='humidityMax' class='rangeLabel rangeMax'>--</span><span id='humidityMin' class='rangeLabel rangeMin'>--</span></div></div><div class='chart'><canvas id='humidityChart'></canvas></div></div>";
-  html += "<div class='metric'><div class='reading'><div class='metricName'>RealFeel (procena)</div><span id='realFeel' class='value'>--</span><span class='unit'> &deg;C</span><div id='realFeelSnapshot' class='snapshotReading'></div></div><div class='trendBox'><div class='trendVisual'><div id='realFeelTrend' class='trend flat'><i class='shaft'></i></div><div id='realFeelRate' class='rate'>--</div></div><div class='rangeStack'><span id='realFeelMax' class='rangeLabel rangeMax'>--</span><span id='realFeelMin' class='rangeLabel rangeMin'>--</span></div></div><div class='chart'><canvas id='realFeelChart'></canvas></div></div>";
-  html += "<div class='metric'><div class='reading'><div class='metricName'>Apsolutna vlaznost</div><span id='absoluteHumidity' class='value'>--</span><span class='unit'> g/m&sup3;</span><div id='absoluteHumiditySnapshot' class='snapshotReading'></div></div><div class='trendBox'><div class='trendVisual'><div id='absoluteHumidityTrend' class='trend flat'><i class='shaft'></i></div><div id='absoluteHumidityRate' class='rate'>--</div></div><div class='rangeStack'><span id='absoluteHumidityMax' class='rangeLabel rangeMax'>--</span><span id='absoluteHumidityMin' class='rangeLabel rangeMin'>--</span></div></div><div class='chart'><canvas id='absoluteHumidityChart'></canvas></div></div>";
+  html += "<section id='liveView' class='view active'><div class='timeline'><div class='timelineTrack'><div class='timelineRail'></div><div id='timelineFill' class='timelineFill'></div><input id='rangeStart' type='range' min='0' max='1' value='0' oninput='applyTimeRange()'><input id='rangeEnd' type='range' min='0' max='1' value='1' oninput='applyTimeRange()'></div><div class='timelineLabels'><span id='recordedFrom'>--</span><span id='recordedTo'>--</span></div><div id='selectedRange' class='selectedRange'>Nema istorije</div></div><div id='cursorInfo' class='cursorInfo'>Dodirni grafikon ili predji misem za detalje.</div><section class='live'>";
+  html += "<div class='metric'><div class='reading'><div class='metricName'>Temperatura</div><span id='temperature' class='value'>--</span><span class='unit'> &deg;C</span><div id='temperatureSnapshot' class='snapshotReading'></div></div><div class='trendBox'><div class='trendVisual'><div id='temperatureTrend' class='trend flat'><i class='shaft'></i></div><div id='temperatureRate' class='rate'>--</div></div><div class='rangeStack'><span id='temperatureMax' class='rangeLabel'>--</span><span id='temperatureDelta' class='rangeLabel rangeDelta'>--</span><span id='temperatureMin' class='rangeLabel'>--</span></div></div><div class='chart'><canvas id='temperatureChart'></canvas></div></div>";
+  html += "<div class='metric'><div class='reading'><div class='metricName'>Relativna vlaznost</div><span id='humidity' class='value'>--</span><span class='unit'> %</span><div id='humiditySnapshot' class='snapshotReading'></div></div><div class='trendBox'><div class='trendVisual'><div id='humidityTrend' class='trend flat'><i class='shaft'></i></div><div id='humidityRate' class='rate'>--</div></div><div class='rangeStack'><span id='humidityMax' class='rangeLabel'>--</span><span id='humidityDelta' class='rangeLabel rangeDelta'>--</span><span id='humidityMin' class='rangeLabel'>--</span></div></div><div class='chart'><canvas id='humidityChart'></canvas></div></div>";
+  html += "<div class='metric'><div class='reading'><div class='metricName'>RealFeel (procena)</div><span id='realFeel' class='value'>--</span><span class='unit'> &deg;C</span><div id='realFeelSnapshot' class='snapshotReading'></div></div><div class='trendBox'><div class='trendVisual'><div id='realFeelTrend' class='trend flat'><i class='shaft'></i></div><div id='realFeelRate' class='rate'>--</div></div><div class='rangeStack'><span id='realFeelMax' class='rangeLabel'>--</span><span id='realFeelDelta' class='rangeLabel rangeDelta'>--</span><span id='realFeelMin' class='rangeLabel'>--</span></div></div><div class='chart'><canvas id='realFeelChart'></canvas></div></div>";
+  html += "<div class='metric'><div class='reading'><div class='metricName'>Apsolutna vlaznost</div><span id='absoluteHumidity' class='value'>--</span><span class='unit'> g/m&sup3;</span><div id='absoluteHumiditySnapshot' class='snapshotReading'></div></div><div class='trendBox'><div class='trendVisual'><div id='absoluteHumidityTrend' class='trend flat'><i class='shaft'></i></div><div id='absoluteHumidityRate' class='rate'>--</div></div><div class='rangeStack'><span id='absoluteHumidityMax' class='rangeLabel'>--</span><span id='absoluteHumidityDelta' class='rangeLabel rangeDelta'>--</span><span id='absoluteHumidityMin' class='rangeLabel'>--</span></div></div><div class='chart'><canvas id='absoluteHumidityChart'></canvas></div></div>";
   html += "</section>";
   html += "<div class='actions'><button id='snapshotButton' onclick='captureSnapshot()'>Napravi snapshot</button><button id='saveSnapshotButton' class='save hidden' onclick='savePendingSnapshot()'>Sacuvaj snapshot</button><span id='message' class='note'></span></div></section>";
   html += "<section id='snapView' class='view'><p class='note'>Snapshotovi su trajno sacuvani u ESP32 memoriji (NVS), najvise 24. <span class='deleteHint'>Drzi red oko 1 sekunde da ga obrises.</span></p><table><thead><tr><th>Vreme</th><th>Temperatura</th><th>Rel. vlaznost</th><th>RealFeel</th><th>Aps. vlaznost</th><th>Komentar</th></tr></thead><tbody id='snapshots'></tbody></table></section>";
@@ -843,8 +874,12 @@ void handleDebugRoot() {
   html += "let live=null;const $=id=>document.getElementById(id);function setTrend(name,rate,scale,unit){const el=$(name+'Trend'),out=$(name+'Rate'),a=Math.abs(rate),flat=a<.005;el.className='trend '+(flat?'flat':rate>0?'up':'down');el.style.setProperty('--len',Math.min(56,12+a*scale)+'px');out.textContent=flat?'stabilno':(rate>0?'+':'')+rate.toFixed(a<.1?2:1)+' '+unit+'/min';}";
   html += "async function refresh(){try{live=await fetch('/status',{cache:'no-store'}).then(r=>r.json());const ok=live.ahtReadingValid;temperature.textContent=ok?live.lastTemperature.toFixed(2):'--';humidity.textContent=ok?live.lastHumidity.toFixed(2):'--';realFeel.textContent=ok?live.lastRealFeel.toFixed(2):'--';absoluteHumidity.textContent=ok?live.lastAbsoluteHumidity.toFixed(2):'--';if(ok){setTrend('temperature',live.temperatureRate,18,'C');setTrend('humidity',live.humidityRate,5,'%');setTrend('realFeel',live.realFeelRate,18,'C');setTrend('absoluteHumidity',live.absoluteHumidityRate,14,'g/m3')}sensorState.textContent=ok?'Senzor je aktivan · osvezavanje 0.5 s':(live.ahtPresent?'Ceka se prvo merenje':'Senzor nije pronadjen');}catch(e){sensorState.textContent='Nema veze sa uredjajem';}}";
   html += "function showTab(t){liveView.classList.toggle('active',t==='live');snapView.classList.toggle('active',t==='snap');networkView.classList.toggle('active',t==='network');debugView.classList.toggle('active',t==='debug');liveTab.classList.toggle('active',t==='live');snapTab.classList.toggle('active',t==='snap');networkTab.classList.toggle('active',t==='network');debugTab.classList.toggle('active',t==='debug');if(t==='snap')loadSnapshots();if(t==='network')loadNetwork();if(t==='debug')loadDebug()}function openUpdate(){location.href='http://'+location.hostname+':8080/webota'}";
-  html += "function drawChart(name,data,key,color,minSpan){const c=$(name+'Chart'),d=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*d;c.height=h*d;const x=c.getContext('2d');x.scale(d,d);x.clearRect(0,0,w,h);const v=data.map(p=>p[key]);if(v.length<2){$(name+'Max').textContent='--';$(name+'Min').textContent='--';return}let rawLo=Math.min(...v),rawHi=Math.max(...v),lo=rawLo,hi=rawHi,mid=(lo+hi)/2;if(hi-lo<minSpan){lo=mid-minSpan/2;hi=mid+minSpan/2}$(name+'Max').textContent=rawHi.toFixed(1);$(name+'Min').textContent=rawLo.toFixed(1);const pts=v.map((n,i)=>({x:i*w/(v.length-1),y:h-5-(n-lo)/(hi-lo)*(h-10)}));x.strokeStyle='#deddd4';x.beginPath();x.moveTo(0,h-1);x.lineTo(w,h-1);x.stroke();x.strokeStyle=color;x.lineWidth=2;x.lineJoin='round';x.lineCap='round';x.beginPath();x.moveTo(pts[0].x,pts[0].y);for(let i=1;i<pts.length-1;i++){const mx=(pts[i].x+pts[i+1].x)/2,my=(pts[i].y+pts[i+1].y)/2;x.quadraticCurveTo(pts[i].x,pts[i].y,mx,my)}x.lineTo(pts[pts.length-1].x,pts[pts.length-1].y);x.stroke()}";
-  html += "async function refreshCharts(){try{const seconds=Number(xRange.value),d=await fetch('/history?range='+seconds,{cache:'no-store'}).then(r=>r.json());drawChart('temperature',d,'t','#c76432',0.6);drawChart('humidity',d,'h','#2878b8',1.5);drawChart('realFeel',d,'r','#8b4aa5',0.6);drawChart('absoluteHumidity',d,'a','#087e6a',0.6)}catch(e){}}";
+  html += "let allChartData=[],chartData=[],cursorIndex=-1,rangeReady=false;const chartDefs=[['temperature','t','#c76432',.6,'C'],['humidity','h','#2878b8',1.5,'%'],['realFeel','r','#8b4aa5',.6,'C'],['absoluteHumidity','a','#087e6a',.6,'g/m3']];function formatMoment(s,full=false){if(s>1700000000){const d=new Date(s*1000);return full?d.toLocaleString():d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}const h=Math.floor(s/3600),m=Math.floor(s%3600/60),q=s%60;return'T+'+[h,m,q].map(n=>String(n).padStart(2,'0')).join(':')}function nearestIndex(data,t){let best=0,dist=Infinity;for(let i=0;i<data.length;i++){const d=Math.abs(data[i].s-t);if(d<dist){dist=d;best=i}}return best}";
+  html += "function drawChart(name,data,key,color,minSpan){const c=$(name+'Chart'),d=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*d;c.height=h*d;const x=c.getContext('2d');x.scale(d,d);x.clearRect(0,0,w,h);const v=data.map(p=>p[key]),deltaEl=$(name+'Delta');if(v.length<2){$(name+'Max').textContent=$(name+'Min').textContent=deltaEl.textContent='--';return}const rawLo=Math.min(...v),rawHi=Math.max(...v),change=v[v.length-1]-v[0];let lo=rawLo,hi=rawHi,mid=(lo+hi)/2;if(hi-lo<minSpan){lo=mid-minSpan/2;hi=mid+minSpan/2}$(name+'Max').textContent=rawHi.toFixed(1);$(name+'Min').textContent=rawLo.toFixed(1);deltaEl.textContent=(Math.abs(change)<.005?'':change>0?'+':'')+change.toFixed(1);deltaEl.className='rangeLabel rangeDelta '+(change>.004?'up':change<-.004?'down':'');const first=data[0].s,last=data[data.length-1].s,span=Math.max(1,last-first),pts=data.map((p,i)=>({x:(p.s-first)*w/span,y:h-5-(v[i]-lo)/(hi-lo)*(h-10)}));x.strokeStyle='#deddd4';x.beginPath();x.moveTo(0,h-1);x.lineTo(w,h-1);x.stroke();x.strokeStyle=color;x.lineWidth=2;x.lineJoin='round';x.lineCap='round';x.beginPath();x.moveTo(pts[0].x,pts[0].y);for(let i=1;i<pts.length-1;i++){const mx=(pts[i].x+pts[i+1].x)/2,my=(pts[i].y+pts[i+1].y)/2;x.quadraticCurveTo(pts[i].x,pts[i].y,mx,my)}x.lineTo(pts[pts.length-1].x,pts[pts.length-1].y);x.stroke();if(cursorIndex>=0&&cursorIndex<pts.length){const p=pts[cursorIndex];x.save();x.strokeStyle='#17211c';x.lineWidth=1;x.setLineDash([4,3]);x.beginPath();x.moveTo(p.x,0);x.lineTo(p.x,h);x.stroke();x.restore();x.fillStyle=color;x.beginPath();x.arc(p.x,p.y,4,0,Math.PI*2);x.fill()}}";
+  html += "function renderCharts(){chartDefs.forEach(c=>drawChart(c[0],chartData,c[1],c[2],c[3]));if(cursorIndex>=0&&chartData[cursorIndex]){const p=chartData[cursorIndex];cursorInfo.innerHTML=`${esc(formatMoment(p.s,true))} &nbsp; T ${p.t.toFixed(2)} C &nbsp; RH ${p.h.toFixed(2)} % &nbsp; RF ${p.r.toFixed(2)} C &nbsp; AH ${p.a.toFixed(2)} g/m3`}else cursorInfo.textContent='Dodirni grafikon ili predji misem za tacno vreme i vrednosti.'}";
+  html += "function applyTimeRange(){const n=allChartData.length;if(n<2){chartData=allChartData;renderCharts();return}let a=Number(rangeStart.value),b=Number(rangeEnd.value);if(a>=b){if(document.activeElement===rangeStart)a=Math.max(0,b-1);else b=Math.min(n-1,a+1)}rangeStart.value=a;rangeEnd.value=b;const max=n-1;timelineFill.style.left=a/max*100+'%';timelineFill.style.width=(b-a)/max*100+'%';recordedFrom.textContent=formatMoment(allChartData[0].s,true);recordedTo.textContent=formatMoment(allChartData[max].s,true);selectedRange.textContent=formatMoment(allChartData[a].s,true)+' — '+formatMoment(allChartData[b].s,true);chartData=allChartData.slice(a,b+1);cursorIndex=-1;renderCharts()}";
+  html += "async function refreshCharts(){try{const oldStart=rangeReady&&allChartData.length?allChartData[Number(rangeStart.value)].s:null,oldEnd=rangeReady&&allChartData.length?allChartData[Number(rangeEnd.value)].s:null,wasAtEnd=!rangeReady||Number(rangeEnd.value)>=allChartData.length-1,d=await fetch('/history?range=86400',{cache:'no-store'}).then(r=>r.json());if(!d.length)return;allChartData=d;const max=d.length-1;rangeStart.max=rangeEnd.max=max;if(!rangeReady){rangeStart.value=0;rangeEnd.value=max;rangeReady=true}else{rangeStart.value=nearestIndex(d,oldStart);rangeEnd.value=wasAtEnd?max:nearestIndex(d,oldEnd)}applyTimeRange()}catch(e){}}";
+  html += "function setCursorFromEvent(e){if(chartData.length<2)return;const r=e.currentTarget.getBoundingClientRect(),ratio=Math.max(0,Math.min(1,(e.clientX-r.left)/r.width));cursorIndex=Math.round(ratio*(chartData.length-1));renderCharts()}function bindChartCursors(){chartDefs.forEach(c=>{const el=$(c[0]+'Chart');el.addEventListener('pointermove',setCursorFromEvent);el.addEventListener('pointerdown',setCursorFromEvent);el.addEventListener('pointerleave',e=>{if(e.pointerType==='mouse'){cursorIndex=-1;renderCharts()}})})}";
   html += "function esc(v){const d=document.createElement('div');d.textContent=v||'';return d.innerHTML}";
   html += "function escAttr(v){return esc(v).replace(/'/g,'&#39;')}";
   html += "function derived(t,h){const e=h/100*6.105*Math.exp(17.27*t/(237.7+t));const r=t+.33*e-4;const es=6.112*Math.exp(17.67*t/(t+243.5));const a=216.7*(es*h/100)/(273.15+t);return{r,a}}";
@@ -859,7 +894,7 @@ void handleDebugRoot() {
   html += "function deleteNetworkByIndex(i){if(i>=0&&i<knownNetworkNames.length)deleteNetwork(knownNetworkNames[i])}async function deleteNetwork(ssid){if(!confirm('Obrisati mrezu '+ssid+'?'))return;const p=new URLSearchParams({ssid});const r=await fetch('/network/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});networkMessage.textContent=await r.text();if(r.ok)await loadNetwork()}";
   html += "function health(el,ok,text){el.className='debugValue '+(ok?'ok':'bad');el.textContent=text}async function loadDebug(){try{const [s,logs]=await Promise.all([fetch('/status',{cache:'no-store'}).then(r=>r.json()),fetch('/logs',{cache:'no-store'}).then(r=>r.text())]);health(debugSensor,s.ahtReadingValid,s.ahtReadingValid?'Radi · '+s.lastTemperature.toFixed(2)+' C / '+s.lastHumidity.toFixed(2)+' %':s.ahtPresent?'Pronadjen, bez validnog merenja':'Nije pronadjen');health(debugBattery,s.bqPresent&&s.bqReadHealthy,s.lastBatteryV>0?s.lastBatteryV.toFixed(2)+' V':'Nema merenja');debugBq.textContent=s.bqPresent?(s.bqReadHealthy?'BQ komunikacija je ispravna':'BQ greska pri citanju'):'BQ nije pronadjen';health(debugBle,true,s.bleConnected?'Klijent povezan':'Aktivan · nema klijenta');health(debugOta,s.webOtaActive,s.webOtaActive?'Aktivan · port 8080':'Nije aktivan');health(debugWifi,s.wifiRssi<0,s.wifiRssi<0?s.wifiRssi+' dBm':'Fallback AP');debugSystem.textContent=Math.round(s.freeHeap/1024)+' KB · '+Math.floor(s.uptimeSeconds/60)+' min · core '+s.appCore;diagnosticLedToggle.checked=s.ledsEnabled;debugLogs.textContent=logs||'Log je prazan.'}catch(e){debugMessage.textContent='Debug podaci nisu dostupni.'}}";
   html += "async function setDiagnosticLeds(enabled){debugMessage.textContent='Cuvam...';const p=new URLSearchParams({enabled:enabled?'1':'0'});const r=await fetch('/debug/leds',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});debugMessage.textContent=r.ok?(enabled?'RGB dijagnostika je ukljucena.':'RGB dijagnostika je iskljucena.'):'Promena nije uspela.'}";
-  html += "setInterval(refresh,500);setInterval(refreshCharts,1000);refresh();refreshCharts();loadSnapshots();";
+  html += "bindChartCursors();setInterval(refresh,500);setInterval(refreshCharts,5000);refresh();refreshCharts();loadSnapshots();";
   html += "</script></main></body></html>";
   }
   debugServer.sendHeader("Cache-Control", "no-store");
@@ -907,13 +942,15 @@ void handleHistory() {
   json.reserve(43000);
   bool first = true;
 
-  if (rangeSeconds > 0 && rangeSeconds <= 600) {
+  if ((rangeSeconds > 0 && rangeSeconds <= 600) ||
+      !persistentHistoryReady || persistentHistory.count == 0) {
     uint16_t start = (historyHead + HISTORY_SIZE - historyCount) % HISTORY_SIZE;
     uint32_t newestSeconds = historyCount ?
                              historyPoints[(historyHead + HISTORY_SIZE - 1) % HISTORY_SIZE].seconds : 0;
-    for (uint16_t i = 0; i < historyCount; i++) {
+    uint16_t stride = historyCount > 600 ? (historyCount + 599) / 600 : 1;
+    for (uint16_t i = 0; i < historyCount; i += stride) {
       const HistoryPoint &p = historyPoints[(start + i) % HISTORY_SIZE];
-      if (newestSeconds - p.seconds > rangeSeconds) continue;
+      if (rangeSeconds <= 600 && newestSeconds - p.seconds > rangeSeconds) continue;
       if (!first) json += ',';
       first = false;
       json += "{\"s\":" + String(p.seconds);
@@ -948,6 +985,17 @@ void handleHistory() {
         json += ",\"a\":" + String(p.absoluteHumidity100 / 100.0f, 2) + '}';
       }
       file.close();
+    }
+    if (historyCount > 0) {
+      const HistoryPoint &latest = historyPoints[(historyHead + HISTORY_SIZE - 1) % HISTORY_SIZE];
+      if (latest.seconds > persistentHistory.sequence) {
+        if (!first) json += ',';
+        json += "{\"s\":" + String(latest.seconds);
+        json += ",\"t\":" + String(latest.temperature, 2);
+        json += ",\"h\":" + String(latest.humidity, 2);
+        json += ",\"r\":" + String(latest.realFeel, 2);
+        json += ",\"a\":" + String(latest.absoluteHumidity, 2) + '}';
+      }
     }
   }
   json += ']';
@@ -1306,6 +1354,7 @@ void loop() {
   if (debugHttpServerActive) {
     debugServer.handleClient();
   }
+  updateClockState();
   updateDiagnosticLeds();
 
   if (networkReconfigurePending && (long)(millis() - networkReconfigureAtMs) >= 0) {
