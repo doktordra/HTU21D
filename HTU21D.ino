@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <WebOTA.h>
 #include <WebServer.h>
+#include "WebInterface.h"
 #include <Adafruit_AHTX0.h>
 #include <Preferences.h>
 #include <SPIFFS.h>
@@ -25,9 +26,22 @@
 #define SERVICE_UUID              "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID       "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define DEBUG_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a9"
+#define HISTORY_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26aa"
 
 NimBLECharacteristic *pCharacteristic = nullptr;
 NimBLECharacteristic *pDebugCharacteristic = nullptr;
+NimBLECharacteristic *pHistoryCharacteristic = nullptr;
+
+bool historyStreamActive = false;
+uint16_t historyStreamIndex = 0;
+uint32_t historyStreamLogical = 0;
+uint32_t historyStreamStride = 1;
+uint32_t historyStreamOldest = 0;
+bool historyStreamPersistent = false;
+uint32_t historyStreamCount = 0;
+bool historyStreamHeaderPending = false;
+uint32_t historyStreamExpectedPoints = 0;
+
 
 bool deviceConnected = false;
 bool otaServerActive = false;
@@ -87,7 +101,7 @@ const size_t DEBUG_BUFFER_MAX = 4096;
 WebServer debugServer(8081);
 Preferences snapshotPreferences;
 Preferences wifiPreferences;
-String dashboardHtml;
+
 Adafruit_NeoPixel diagnosticLeds(DIAGNOSTIC_LED_COUNT, DIAGNOSTIC_LED_PIN, NEO_GRB + NEO_KHZ800);
 
 const uint8_t MAX_SNAPSHOTS = 24;
@@ -184,6 +198,7 @@ void handleDebugRoot();
 void handleDebugLogs();
 void handleDebugStatus();
 void handleHistory();
+void handleHistoryInterpolate();
 void handleDebugSet();
 void handleSnapshots();
 void handleSnapshotCreate();
@@ -194,6 +209,8 @@ void handleNetworkScan();
 void handleNetworkSave();
 void handleNetworkDelete();
 void handleDiagnosticLedSet();
+void handleDebugWifiSet();
+void setWifiEnabled(bool enabled);
 void loadSnapshots();
 void saveSnapshots();
 void loadKnownNetworks();
@@ -216,6 +233,7 @@ void updateClimateMetrics(float temperature, float humidity);
 bool initPersistentHistory();
 void accumulatePersistentHistory(float temperature, float humidity, float realFeel, float absoluteHumidity);
 bool flushPersistentHistoryBatch();
+bool interpolatePersistentRange(uint32_t startEpoch, uint32_t endEpoch, uint32_t &patched);
 
 void writeBQRegister(uint8_t reg, uint8_t value);
 bool readBQRegisterWithMode(uint8_t reg, uint8_t &value, bool useRepeatedStart);
@@ -226,6 +244,7 @@ void dumpBQRegisters();
 void sampleBattery(bool force = false);
 void initDiagnosticLeds();
 void updateDiagnosticLeds();
+void startDiagnosticLedTask();
 void setDiagnosticLedsOff();
 
 float calculateAbsoluteHumidity(float temperature, float humidity) {
@@ -333,6 +352,83 @@ bool flushPersistentHistoryBatch() {
     persistentBatchCount = 0;
   }
   return ok;
+}
+
+// Binary search over stored epoch sequences (not the current clock) so delta-sync stays correct across reboots.
+uint32_t findPersistentSkipCount(uint32_t sinceEpoch, uint32_t oldestPhysical, uint32_t count) {
+  if (sinceEpoch == 0 || count == 0) return 0;
+  File file = SPIFFS.open(PERSISTENT_HISTORY_PATH, FILE_READ);
+  if (!file) return 0;
+  uint32_t lo = 0, hi = count;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2;
+    uint32_t physical = (oldestPhysical + mid) % persistentHistory.capacity;
+    size_t offset = sizeof(PersistentHistoryHeader) + (size_t)physical * sizeof(PersistentHistoryPoint);
+    PersistentHistoryPoint p;
+    if (!file.seek(offset, SeekSet) || file.read((uint8_t*)&p, sizeof(p)) != sizeof(p)) break;
+    if (p.sequence <= sinceEpoch) lo = mid + 1;
+    else hi = mid;
+  }
+  file.close();
+  return lo;
+}
+
+// Rewrites the stored range [startEpoch, endEpoch] with a linear ramp between the surrounding
+// good samples, so a correction made in one client is visible to every other client.
+bool interpolatePersistentRange(uint32_t startEpoch, uint32_t endEpoch, uint32_t &patched) {
+  patched = 0;
+  if (!persistentHistoryReady || persistentHistory.count == 0 || endEpoch < startEpoch) return false;
+  if (!flushPersistentHistoryBatch()) return false;
+
+  const uint32_t count = persistentHistory.count;
+  const uint32_t oldest = (persistentHistory.head + persistentHistory.capacity - count) % persistentHistory.capacity;
+  const uint32_t first = startEpoch == 0 ? 0 : findPersistentSkipCount(startEpoch - 1, oldest, count);
+  const uint32_t afterLast = findPersistentSkipCount(endEpoch, oldest, count);
+  if (afterLast <= first) return false;
+
+  File file = SPIFFS.open(PERSISTENT_HISTORY_PATH, "r+");
+  if (!file) return false;
+
+  auto readAt = [&](uint32_t logical, PersistentHistoryPoint &p) {
+    uint32_t physical = (oldest + logical) % persistentHistory.capacity;
+    size_t offset = sizeof(PersistentHistoryHeader) + (size_t)physical * sizeof(PersistentHistoryPoint);
+    return file.seek(offset, SeekSet) && file.read((uint8_t*)&p, sizeof(p)) == sizeof(p);
+  };
+
+  PersistentHistoryPoint left, right;
+  bool hasLeft = first > 0 && readAt(first - 1, left);
+  bool hasRight = afterLast < count && readAt(afterLast, right);
+  if (!hasLeft && !hasRight) {
+    file.close();
+    return false;
+  }
+  if (!hasLeft) left = right;
+  if (!hasRight) right = left;
+
+  const float span = (float)right.sequence - (float)left.sequence;
+  bool ok = true;
+  for (uint32_t logical = first; logical < afterLast && ok; logical++) {
+    PersistentHistoryPoint p;
+    if (!readAt(logical, p)) { ok = false; break; }
+
+    float frac = span <= 0.0f ? 0.0f : ((float)p.sequence - (float)left.sequence) / span;
+    float t = (left.temperature100 + frac * (right.temperature100 - left.temperature100)) / 100.0f;
+    float h = (left.humidity100 + frac * (right.humidity100 - left.humidity100)) / 100.0f;
+    p.temperature100 = (int16_t)roundf(t * 100.0f);
+    p.humidity100 = (int16_t)roundf(h * 100.0f);
+    p.realFeel100 = (int16_t)roundf(calculateRealFeel(t, h) * 100.0f);
+    p.absoluteHumidity100 = (int16_t)roundf(calculateAbsoluteHumidity(t, h) * 100.0f);
+
+    uint32_t physical = (oldest + logical) % persistentHistory.capacity;
+    size_t offset = sizeof(PersistentHistoryHeader) + (size_t)physical * sizeof(PersistentHistoryPoint);
+    ok = file.seek(offset, SeekSet) &&
+         file.write((const uint8_t*)&p, sizeof(p)) == sizeof(p);
+    if (ok) patched++;
+  }
+  file.close();
+
+  debugLogf("Istorija: interpolirano %lu tacaka (%lu-%lu).", patched, startEpoch, endEpoch);
+  return ok && patched > 0;
 }
 
 void accumulatePersistentHistory(float temperature, float humidity, float realFeel, float absoluteHumidity) {
@@ -455,6 +551,70 @@ void debugLogf(const char* fmt, ...) {
   }
 }
 
+
+class MyHistoryCallbacks: public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* pChar) {
+    std::string value = pChar->getValue();
+    if (value.empty()) return;
+    if (value[0] == 'I' && value.size() >= 9) { // "I" + start epoch + end epoch (both 4 LE bytes)
+      auto le32 = [&](size_t i) {
+        return (uint32_t)(uint8_t)value[i] |
+               ((uint32_t)(uint8_t)value[i + 1] << 8) |
+               ((uint32_t)(uint8_t)value[i + 2] << 16) |
+               ((uint32_t)(uint8_t)value[i + 3] << 24);
+      };
+      uint32_t patched = 0;
+      interpolatePersistentRange(le32(1), le32(5), patched);
+      return;
+    }
+    if (value[0] == 'G') { // "G" + optional 4 LE bytes: epoch to sync since (0 or absent = full history)
+      uint32_t sinceEpoch = 0;
+      if (value.size() >= 5) {
+        sinceEpoch = (uint32_t)(uint8_t)value[1] |
+                     ((uint32_t)(uint8_t)value[2] << 8) |
+                     ((uint32_t)(uint8_t)value[3] << 16) |
+                     ((uint32_t)(uint8_t)value[4] << 24);
+      }
+      uint32_t rangeSeconds = 86400;
+      historyStreamActive = true;
+      historyStreamIndex = 0;
+      historyStreamLogical = 0;
+      uint32_t remainingPoints = 0;
+
+      if (!persistentHistoryReady || persistentHistory.count == 0) {
+        historyStreamPersistent = false;
+        historyStreamCount = historyCount;
+        uint16_t skip = 0;
+        if (sinceEpoch > 0) {
+          uint16_t oldestIdx = (historyHead + HISTORY_SIZE - historyCount) % HISTORY_SIZE;
+          while (skip < historyCount && historyPoints[(oldestIdx + skip) % HISTORY_SIZE].seconds <= sinceEpoch) {
+            skip++;
+          }
+        }
+        historyStreamIndex = skip;
+        remainingPoints = historyCount - skip;
+        historyStreamStride = remainingPoints > 600 ? (remainingPoints + 599) / 600 : 1;
+      } else {
+        historyStreamPersistent = true;
+        historyStreamOldest = (persistentHistory.head + persistentHistory.capacity - persistentHistory.count) % persistentHistory.capacity;
+        uint32_t skip = sinceEpoch > 0
+          ? findPersistentSkipCount(sinceEpoch, historyStreamOldest, persistentHistory.count)
+          : (persistentHistory.count > rangeSeconds ? persistentHistory.count - rangeSeconds : 0);
+        uint32_t req = persistentHistory.count - skip;
+        historyStreamStride = req > 600 ? (req + 599) / 600 : 1;
+        historyStreamLogical = skip;
+        historyStreamCount = persistentHistory.count;
+        remainingPoints = req;
+      }
+
+      historyStreamExpectedPoints = historyStreamStride == 0 ? 0 : (remainingPoints + historyStreamStride - 1) / historyStreamStride;
+      historyStreamHeaderPending = true;
+      debugLogf("BLE History Stream pokrenut (since=%lu, %lu novih tacaka).", sinceEpoch, remainingPoints);
+    }
+  }
+};
+
+
 class MyServerCallbacks: public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) override {
     deviceConnected = true;
@@ -464,6 +624,8 @@ class MyServerCallbacks: public NimBLEServerCallbacks {
 
   void onDisconnect(NimBLEServer* pServer) override {
     deviceConnected = false;
+    historyStreamActive = false;
+    historyStreamHeaderPending = false;
     debugLogf("Klijent otkacen. Ponovno oglasavanje...");
     pServer->getAdvertising()->start();
   }
@@ -479,6 +641,18 @@ class MyCharacteristicCallbacks: public NimBLECharacteristicCallbacks {
     if (value[0] == OTA_TRIGGER_CHAR) {
       otaStartRequested = true;
       debugLogf("BLE komanda primljena: pokretanje OTA servera.");
+    } else if (value[0] == 'W' && value.size() >= 2) {
+      setWifiEnabled(value[1] != 0);
+    } else if (value[0] == 'T' && value.size() >= 5) {
+      // Primanje apsolutnog Unix vremena sa mobilnog telefona za instant RTC sinkronizaciju preko BLE.
+      uint32_t epoch = (uint32_t)(uint8_t)value[1] |
+                       ((uint32_t)(uint8_t)value[2] << 8) |
+                       ((uint32_t)(uint8_t)value[3] << 16) |
+                       ((uint32_t)(uint8_t)value[4] << 24);
+      struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
+      settimeofday(&tv, NULL);
+      updateClockState();
+      debugLogf("Vreme sinhronizovano preko BLE: %lu", (unsigned long)epoch);
     }
   }
 
@@ -665,6 +839,19 @@ void initDiagnosticLeds() {
   diagnosticLedPhaseMs = millis() - DIAGNOSTIC_LED_PERIOD_MS;
 }
 
+// Runs on its own core so LED timing stays precise regardless of how busy loop() gets
+// (BLE streaming, WebOTA, debug HTTP server, etc. all run on the other core).
+void diagnosticLedTask(void *parameter) {
+  for (;;) {
+    updateDiagnosticLeds();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void startDiagnosticLedTask() {
+  xTaskCreatePinnedToCore(diagnosticLedTask, "DiagLED", 2048, NULL, 1, NULL, 0);
+}
+
 void updateDiagnosticLeds() {
   if (!diagnosticLedsEnabled) {
     if (diagnosticLedsLit) setDiagnosticLedsOff();
@@ -828,6 +1015,7 @@ void setupDebugHttpServer() {
   debugServer.on("/logs", HTTP_GET, handleDebugLogs);
   debugServer.on("/status", HTTP_GET, handleDebugStatus);
   debugServer.on("/history", HTTP_GET, handleHistory);
+  debugServer.on("/history/interpolate", HTTP_POST, handleHistoryInterpolate);
   debugServer.on("/set", HTTP_GET, handleDebugSet);
   debugServer.on("/snapshots", HTTP_GET, handleSnapshots);
   debugServer.on("/snapshot", HTTP_POST, handleSnapshotCreate);
@@ -838,67 +1026,17 @@ void setupDebugHttpServer() {
   debugServer.on("/network/save", HTTP_POST, handleNetworkSave);
   debugServer.on("/network/delete", HTTP_POST, handleNetworkDelete);
   debugServer.on("/debug/leds", HTTP_POST, handleDiagnosticLedSet);
+  debugServer.on("/debug/wifi", HTTP_POST, handleDebugWifiSet);
   debugServer.begin();
   debugHttpServerActive = true;
 }
 
 void handleDebugRoot() {
-  String &html = dashboardHtml;
-  if (html.length() == 0) {
-  html.reserve(27000);
-  html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>VoiceToys Weather Station</title><style>:root{--ink:#17211c;--paper:#f4f1e8;--accent:#087e6a;--line:#c9c7ba;--up:#14834b;--down:#c43b32;--flat:#d2a400}";
-  html += "*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:Georgia,serif}";
-  html += "main{width:min(900px,calc(100% - 24px));margin:24px auto}header{display:flex;justify-content:space-between;align-items:end;border-bottom:2px solid var(--ink);padding-bottom:12px;gap:10px}";
-  html += "h1{font-size:24px;margin:0}.tabs,.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.tabs{margin:14px 0}.tab{background:#d9d8ce;color:var(--ink)}.tab.active{background:var(--accent);color:#fff}.view{display:none}.view.active{display:block}";
-  html += ".live{display:grid;gap:12px;margin:14px 0 22px}.metric{display:grid;grid-template-columns:minmax(190px,220px) 164px minmax(0,1fr);align-items:center;column-gap:8px;position:relative;border:1px solid var(--line);padding:16px;background:#fff;min-height:148px}.reading{align-self:center}.metricName{font-size:17px;font-weight:700;color:#445149;margin-bottom:4px}.value{font:700 clamp(34px,6vw,50px) Georgia,serif}.unit{font-size:17px;color:#59635d}";
-  html += ".trendBox{display:grid;grid-template-columns:78px 58px;align-items:center;justify-content:start;gap:6px;min-width:164px;padding-right:14px}.trendVisual{display:grid;grid-template-rows:82px auto;justify-items:center;align-items:center}.rangeStack{height:112px;display:flex;flex-direction:column;justify-content:space-between;align-items:flex-start}.rangeLabel{font:700 20px Arial,sans-serif;color:#35443c;white-space:nowrap}.rangeDelta{font-size:16px;color:#59665f}.rangeDelta.up{color:var(--up)}.rangeDelta.down{color:var(--down)}.metric .rate{font:700 14px Arial,sans-serif;color:#45524a;white-space:nowrap;text-align:center;margin-top:3px}.trend{position:relative;width:34px;height:78px;color:var(--flat);transform:rotate(0deg);transition:transform .45s cubic-bezier(.2,.8,.2,1),color .35s ease}.trend .shaft{position:absolute;left:15px;bottom:9px;width:4px;height:var(--len,0px);max-height:56px;background:currentColor;border-radius:4px;transition:height .55s cubic-bezier(.2,.8,.2,1)}.trend .shaft:before{content:'';position:absolute;left:-5px;top:-3px;border-left:7px solid transparent;border-right:7px solid transparent;border-bottom:10px solid currentColor;transform:translateY(-7px)}.trend.down{color:var(--down);transform:rotate(180deg)}.trend.up{color:var(--up)}.trend.flat{color:var(--flat);transform:rotate(90deg)}.trend.flat .shaft{height:25px!important}.trend.flat .shaft:before{display:block}.chart{min-width:0}.chart canvas{display:block;width:100%;height:112px;touch-action:none}";
-  html += "button{border:0;background:var(--accent);color:#fff;padding:11px 16px;font-weight:700;cursor:pointer}button:disabled{opacity:.5}.update{background:#263d70}.actions{margin:12px 0 22px}.note{font-size:13px;color:#59635d}";
-  html += ".timeline{background:#fff;border:1px solid var(--line);padding:14px 18px;margin:10px 0 14px}.timelineTrack{position:relative;height:28px;margin:2px 5px}.timelineRail,.timelineFill{position:absolute;left:0;right:0;top:12px;height:5px;border-radius:5px;background:#d4d5cf}.timelineFill{right:auto;background:var(--accent)}.timeline input[type=range]{position:absolute;left:0;top:0;width:100%;height:28px;margin:0;padding:0;border:0;background:transparent;pointer-events:none;appearance:none}.timeline input[type=range]::-webkit-slider-thumb{appearance:none;width:22px;height:22px;border-radius:50%;background:#fff;border:4px solid var(--accent);box-shadow:0 1px 4px #0005;pointer-events:auto;cursor:grab}.timeline input[type=range]::-moz-range-thumb{width:15px;height:15px;border-radius:50%;background:#fff;border:4px solid var(--accent);box-shadow:0 1px 4px #0005;pointer-events:auto;cursor:grab}.timelineLabels{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:10px;font:700 13px Arial,sans-serif;color:#46534c}.timelineLabels span:nth-child(2){text-align:center}.timelineLabels span:last-child{text-align:right}.snapshotReading{min-height:16px;margin-top:5px;color:#8a6320;font:12px Arial,sans-serif}.save{background:#9b6516}.hidden{display:none!important}.deleteHint{color:#8e4038}.snapshotRow{touch-action:manipulation}";
-  html += "table{width:100%;border-collapse:collapse;background:#fff}th,td{text-align:left;border-bottom:1px solid var(--line);padding:10px;vertical-align:top}th{font-size:12px;text-transform:uppercase}";
-  html += "input,select{width:100%;min-width:140px;padding:8px;border:1px solid var(--line);font:14px Georgia,serif}.networkCard{background:#fff;border:1px solid var(--line);padding:16px;margin:12px 0}.networkCard h2{font-size:18px;margin:0 0 10px}.networkForm{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:end}.networkList{display:grid;gap:7px;margin-top:10px}.networkItem{display:flex;justify-content:space-between;align-items:center;gap:8px;border-bottom:1px solid var(--line);padding:7px 0}.danger{background:#9d332c}.address{font-family:Arial,sans-serif;font-weight:700;word-break:break-all}.debugGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.debugValue{font:700 20px Arial,sans-serif}.ok{color:var(--up)}.bad{color:var(--down)}.switchLine{display:flex;align-items:center;gap:10px}.switchLine input{width:auto;min-width:0}#debugLogs{display:block;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto;background:#18201c;color:#dce8df;padding:12px;font:11px monospace}#message,#networkMessage,#debugMessage{min-height:20px}";
-  html += "@media(max-width:620px){main{margin:12px auto}.metric{grid-template-columns:minmax(0,1fr) 164px;padding:14px 12px;column-gap:4px;min-height:0}.metricName{font-size:16px}.value{font-size:38px}.unit{font-size:15px}.trendBox{grid-column:2;grid-row:1}.chart{grid-column:1/-1}.chart canvas{height:104px}.timeline{padding:12px 10px}.timelineLabels{font-size:11px;gap:5px}header{align-items:start;flex-direction:column}.networkForm{grid-template-columns:1fr}.networkForm button{width:100%}table,thead,tbody,tr,th,td{display:block}thead{display:none}tr{border-bottom:2px solid var(--ink)}td{border:0;padding:6px 10px}}</style></head><body><main>";
-  html += "<header><h1>VoiceToys Weather Station</h1><span id='sensorState' class='note'>Povezivanje...</span></header>";
-  html += "<nav class='tabs'><button id='liveTab' class='tab active' onclick=\"showTab('live')\">Uzivo</button><button id='snapTab' class='tab' onclick=\"showTab('snap')\">Snapshotovi</button><button id='networkTab' class='tab' onclick=\"showTab('network')\">Network</button><button id='debugTab' class='tab' onclick=\"showTab('debug')\">Debug</button></nav>";
-  html += "<section id='liveView' class='view active'><div class='timeline'><div class='timelineTrack'><div class='timelineRail'></div><div id='timelineFill' class='timelineFill'></div><input id='rangeStart' type='range' min='0' max='1' value='0' oninput='applyTimeRange()'><input id='rangeEnd' type='range' min='0' max='1' value='1' oninput='applyTimeRange()'></div><div class='timelineLabels'><span id='recordedFrom'>--:--:--</span><span id='recordedDate'>--/--/----</span><span id='recordedTo'>--:--:--</span></div></div><section class='live'>";
-  html += "<div class='metric'><div class='reading'><div class='metricName'>Temperatura</div><span id='temperature' class='value'>--</span><span class='unit'> &deg;C</span><div id='temperatureSnapshot' class='snapshotReading'></div></div><div class='trendBox'><div class='trendVisual'><div id='temperatureTrend' class='trend flat'><i class='shaft'></i></div><div id='temperatureRate' class='rate'>--</div></div><div class='rangeStack'><span id='temperatureMax' class='rangeLabel'>--</span><span id='temperatureDelta' class='rangeLabel rangeDelta'>--</span><span id='temperatureMin' class='rangeLabel'>--</span></div></div><div class='chart'><canvas id='temperatureChart'></canvas></div></div>";
-  html += "<div class='metric'><div class='reading'><div class='metricName'>Relativna vlaznost</div><span id='humidity' class='value'>--</span><span class='unit'> %</span><div id='humiditySnapshot' class='snapshotReading'></div></div><div class='trendBox'><div class='trendVisual'><div id='humidityTrend' class='trend flat'><i class='shaft'></i></div><div id='humidityRate' class='rate'>--</div></div><div class='rangeStack'><span id='humidityMax' class='rangeLabel'>--</span><span id='humidityDelta' class='rangeLabel rangeDelta'>--</span><span id='humidityMin' class='rangeLabel'>--</span></div></div><div class='chart'><canvas id='humidityChart'></canvas></div></div>";
-  html += "<div class='metric'><div class='reading'><div class='metricName'>RealFeel (procena)</div><span id='realFeel' class='value'>--</span><span class='unit'> &deg;C</span><div id='realFeelSnapshot' class='snapshotReading'></div></div><div class='trendBox'><div class='trendVisual'><div id='realFeelTrend' class='trend flat'><i class='shaft'></i></div><div id='realFeelRate' class='rate'>--</div></div><div class='rangeStack'><span id='realFeelMax' class='rangeLabel'>--</span><span id='realFeelDelta' class='rangeLabel rangeDelta'>--</span><span id='realFeelMin' class='rangeLabel'>--</span></div></div><div class='chart'><canvas id='realFeelChart'></canvas></div></div>";
-  html += "<div class='metric'><div class='reading'><div class='metricName'>Apsolutna vlaznost</div><span id='absoluteHumidity' class='value'>--</span><span class='unit'> g/m&sup3;</span><div id='absoluteHumiditySnapshot' class='snapshotReading'></div></div><div class='trendBox'><div class='trendVisual'><div id='absoluteHumidityTrend' class='trend flat'><i class='shaft'></i></div><div id='absoluteHumidityRate' class='rate'>--</div></div><div class='rangeStack'><span id='absoluteHumidityMax' class='rangeLabel'>--</span><span id='absoluteHumidityDelta' class='rangeLabel rangeDelta'>--</span><span id='absoluteHumidityMin' class='rangeLabel'>--</span></div></div><div class='chart'><canvas id='absoluteHumidityChart'></canvas></div></div>";
-  html += "</section>";
-  html += "<div class='actions'><button id='snapshotButton' onclick='captureSnapshot()'>Napravi snapshot</button><button id='saveSnapshotButton' class='save hidden' onclick='savePendingSnapshot()'>Sacuvaj snapshot</button><span id='message' class='note'></span></div></section>";
-  html += "<section id='snapView' class='view'><p class='note'>Snapshotovi su trajno sacuvani u ESP32 memoriji (NVS), najvise 24. <span class='deleteHint'>Drzi red oko 1 sekunde da ga obrises.</span></p><table><thead><tr><th>Vreme</th><th>Temperatura</th><th>Rel. vlaznost</th><th>RealFeel</th><th>Aps. vlaznost</th><th>Komentar</th></tr></thead><tbody id='snapshots'></tbody></table></section>";
-  html += "<section id='networkView' class='view'><div class='networkCard'><h2>Status mreze</h2><div id='networkState'>Ucitavanje...</div><p class='note'>Na kucnoj mrezi otvori:</p><div class='address'>http://ws.local:8081/</div></div><div class='networkCard'><h2>Dodaj ili promeni mrezu</h2><p class='note'>Izaberi skeniranu mrezu ili upisi SSID. Lozinka se cuva samo u ESP32 NVS memoriji.</p><div class='networkForm'><label>Wi-Fi mreza<input id='networkSsid' list='availableNetworks' maxlength='32' placeholder='SSID'><datalist id='availableNetworks'></datalist></label><label>Lozinka<input id='networkPassword' type='password' maxlength='64' autocomplete='new-password' placeholder='Prazno za otvorenu mrezu'></label><button onclick='saveNetwork()'>Sacuvaj</button></div><div class='actions'><button onclick='scanNetworks()'>Pretrazi mreze</button><span id='networkMessage' class='note'></span></div></div><div class='networkCard'><h2>Zapamcene mreze</h2><div id='knownNetworks' class='networkList'></div></div><div class='networkCard'><h2>Firmware</h2><p class='note'>Update radi i preko kucne mreze i preko fallback AP mreze.</p><button class='update' onclick='openUpdate()'>Update firmware</button></div></section>";
-  html += "<section id='debugView' class='view'><div class='debugGrid'><div class='networkCard'><h2>AHT senzor</h2><div id='debugSensor' class='debugValue'>--</div><div class='note'>I2C SDA 1 / SCL 3</div></div><div class='networkCard'><h2>Baterija / BQ25895</h2><div id='debugBattery' class='debugValue'>--</div><div id='debugBq' class='note'>--</div></div><div class='networkCard'><h2>BLE</h2><div id='debugBle' class='debugValue'>--</div></div><div class='networkCard'><h2>WebOTA</h2><div id='debugOta' class='debugValue'>--</div></div><div class='networkCard'><h2>Wi-Fi signal</h2><div id='debugWifi' class='debugValue'>--</div></div><div class='networkCard'><h2>Sistem</h2><div id='debugSystem' class='debugValue'>--</div></div></div><div class='networkCard'><h2>RGB dijagnostika</h2><label class='switchLine'><input id='diagnosticLedToggle' type='checkbox' onchange='setDiagnosticLeds(this.checked)'>Kratak impuls na svake 3 sekunde</label><p class='note'>LED 1: baterija zeleno / zuto / crveno. LED 2: AHT senzor zeleno / crveno. Osvetljenje je ograniceno radi stednje baterije.</p><span id='debugMessage' class='note'></span></div><div class='networkCard'><h2>Debug log</h2><button onclick='loadDebug()'>Osvezi</button><pre id='debugLogs'>--</pre></div></section>";
-  html += "<script>";
-  html += "let live=null;const $=id=>document.getElementById(id);function setTrend(name,rate,scale,unit){const el=$(name+'Trend'),out=$(name+'Rate'),a=Math.abs(rate),flat=a<.005;el.className='trend '+(flat?'flat':rate>0?'up':'down');el.style.setProperty('--len',Math.min(56,12+a*scale)+'px');out.textContent=flat?'stabilno':(rate>0?'+':'')+rate.toFixed(a<.1?2:1)+' '+unit+'/min';}";
-  html += "async function refresh(){try{live=await fetch('/status',{cache:'no-store'}).then(r=>r.json());const ok=live.ahtReadingValid;temperature.textContent=ok?live.lastTemperature.toFixed(2):'--';humidity.textContent=ok?live.lastHumidity.toFixed(2):'--';realFeel.textContent=ok?live.lastRealFeel.toFixed(2):'--';absoluteHumidity.textContent=ok?live.lastAbsoluteHumidity.toFixed(2):'--';if(ok){setTrend('temperature',live.temperatureRate,18,'C');setTrend('humidity',live.humidityRate,5,'%');setTrend('realFeel',live.realFeelRate,18,'C');setTrend('absoluteHumidity',live.absoluteHumidityRate,14,'g/m3')}sensorState.textContent=ok?'Senzor je aktivan · osvezavanje 0.5 s':(live.ahtPresent?'Ceka se prvo merenje':'Senzor nije pronadjen');}catch(e){sensorState.textContent='Nema veze sa uredjajem';}}";
-  html += "function showTab(t){liveView.classList.toggle('active',t==='live');snapView.classList.toggle('active',t==='snap');networkView.classList.toggle('active',t==='network');debugView.classList.toggle('active',t==='debug');liveTab.classList.toggle('active',t==='live');snapTab.classList.toggle('active',t==='snap');networkTab.classList.toggle('active',t==='network');debugTab.classList.toggle('active',t==='debug');if(t==='snap')loadSnapshots();if(t==='network')loadNetwork();if(t==='debug')loadDebug()}function openUpdate(){location.href='http://'+location.hostname+':8080/webota'}";
-  html += "let allChartData=[],chartData=[],cursorIndex=-1,rangeReady=false,rangeWindowSize=0,liveRangeFollow=true;const chartDefs=[['temperature','t','#c76432',.6,'C'],['humidity','h','#2878b8',1.5,'%'],['realFeel','r','#8b4aa5',.6,'C'],['absoluteHumidity','a','#087e6a',.6,'g/m3']];function clamp(v,min,max){return Math.min(max,Math.max(min,v))}function formatMoment(s,full=false){if(s>1700000000){const d=new Date(s*1000);return full?d.toLocaleString():d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}const h=Math.floor(s/3600),m=Math.floor(s%3600/60),q=s%60;return'T+'+[h,m,q].map(n=>String(n).padStart(2,'0')).join(':')}function formatDate(s){return s>1700000000?new Date(s*1000).toLocaleDateString():'od ukljucenja'}function nearestIndex(data,t){if(!data.length)return 0;let best=0,dist=Infinity;for(let i=0;i<data.length;i++){const d=Math.abs(data[i].s-t);if(d<dist){dist=d;best=i}}return best}";
-  html += "function drawChart(name,data,key,color,minSpan){const c=$(name+'Chart'),d=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*d;c.height=h*d;const x=c.getContext('2d');x.setTransform(1,0,0,1,0,0);x.clearRect(0,0,c.width,c.height);x.scale(d,d);const v=data.map(p=>p[key]),deltaEl=$(name+'Delta');if(v.length<2){$(name+'Max').textContent=$(name+'Min').textContent=deltaEl.textContent='--';return}const rawLo=Math.min(...v),rawHi=Math.max(...v),change=v[v.length-1]-v[0],shownChange=Math.abs(change)<.05?0:change;let lo=rawLo,hi=rawHi,mid=(lo+hi)/2;if(hi-lo<minSpan){lo=mid-minSpan/2;hi=mid+minSpan/2}$(name+'Max').textContent=rawHi.toFixed(1);$(name+'Min').textContent=rawLo.toFixed(1);deltaEl.textContent=(shownChange>0?'+':'')+shownChange.toFixed(1);deltaEl.className='rangeLabel rangeDelta '+(shownChange>0?'up':shownChange<0?'down':'');const first=data[0].s,last=data[data.length-1].s,span=Math.max(1,last-first),pts=data.map((p,i)=>({x:(p.s-first)*w/span,y:h-5-(v[i]-lo)/(hi-lo)*(h-10)}));x.strokeStyle='#deddd4';x.beginPath();x.moveTo(0,h-1);x.lineTo(w,h-1);x.stroke();x.strokeStyle=color;x.lineWidth=2;x.lineJoin='round';x.lineCap='round';x.beginPath();x.moveTo(pts[0].x,pts[0].y);for(let i=1;i<pts.length-1;i++){const mx=(pts[i].x+pts[i+1].x)/2,my=(pts[i].y+pts[i+1].y)/2;x.quadraticCurveTo(pts[i].x,pts[i].y,mx,my)}x.lineTo(pts[pts.length-1].x,pts[pts.length-1].y);x.stroke();if(cursorIndex>=0&&cursorIndex<pts.length){const p=pts[cursorIndex];const metricMeta={t:{label:'T',unit:'C'},h:{label:'RH',unit:'%'},r:{label:'RF',unit:'C'},a:{label:'AH',unit:'g/m3'}};const meta=metricMeta[key]||{label:key.toUpperCase(),unit:''};const valueText=`${meta.label} ${Number(data[cursorIndex][key]).toFixed(2)} ${meta.unit}`;const labelWidth=120,labelHeight=38,labelX=Math.min(w-labelWidth-8,Math.max(8,p.x+12)),labelY=Math.max(10,p.y-labelHeight-12);x.save();x.strokeStyle='#17211c';x.lineWidth=1;x.setLineDash([4,3]);x.beginPath();x.moveTo(p.x,0);x.lineTo(p.x,h);x.stroke();x.restore();x.fillStyle='#f7f4ee';x.strokeStyle='#17211c';x.lineWidth=1;x.fillRect(labelX,labelY,labelWidth,labelHeight);x.strokeRect(labelX,labelY,labelWidth,labelHeight);x.fillStyle='#17211c';x.font='11px Arial';x.fillText(formatMoment(data[cursorIndex].s,true),labelX+8,labelY+14);x.fillText(valueText,labelX+8,labelY+28);x.fillStyle=color;x.beginPath();x.arc(p.x,p.y,4,0,Math.PI*2);x.fill();}}";
-  html += "function renderCharts(){if(chartData.length&&cursorIndex>=chartData.length)cursorIndex=chartData.length-1;chartDefs.forEach(c=>drawChart(c[0],chartData,c[1],c[2],c[3]));}";
-  html += "function applyTimeRange(){const n=allChartData.length;if(n<2){chartData=allChartData;renderCharts();return}const isManual=document.activeElement===rangeStart||document.activeElement===rangeEnd;if(isManual){liveRangeFollow=false;}let a=clamp(Math.round(Number(rangeStart.value)),0,n-1);let b=clamp(Math.round(Number(rangeEnd.value)),a,n-1);if(b<=a){if(document.activeElement===rangeStart){b=Math.min(n-1,a+1)}else{a=Math.max(0,b-1)}}if(liveRangeFollow && b>=n-1){const windowSize=Math.max(1,rangeWindowSize||60);a=Math.max(0,n-windowSize);b=n-1}else if(rangeWindowSize>0 && !liveRangeFollow){const maxWindow=Math.max(1,rangeWindowSize);b=Math.min(n-1,a+maxWindow);if(b<=a){b=Math.min(n-1,a+1)}}rangeStart.value=a;rangeEnd.value=b;rangeWindowSize=Math.max(1,b-a);const max=n-1,start=allChartData[a].s,end=allChartData[b].s,d1=formatDate(start),d2=formatDate(end);timelineFill.style.left=a/max*100+'%';timelineFill.style.width=(b-a)/max*100+'%';recordedFrom.textContent=formatMoment(start);recordedTo.textContent=formatMoment(end);recordedDate.textContent=d1===d2?d1:d1+' / '+d2;chartData=allChartData.slice(a,b+1);if(cursorIndex>=chartData.length)cursorIndex=chartData.length-1;renderCharts()}";
-  html += "async function refreshCharts(){try{const userDragging=document.activeElement===rangeStart||document.activeElement===rangeEnd;if(userDragging){liveRangeFollow=false;}const oldWindow=rangeReady?Math.max(1,Number(rangeEnd.value)-Number(rangeStart.value)):0;const wasAtEnd=rangeReady&&Number(rangeEnd.value)>=Math.max(0,allChartData.length-1);const d=await fetch('/history?range=86400',{cache:'no-store'}).then(r=>r.json());if(!d.length)return;allChartData=d;const max=d.length-1;rangeStart.max=rangeEnd.max=max;if(!rangeReady){rangeStart.value=0;rangeEnd.value=max;rangeReady=true;liveRangeFollow=true;rangeWindowSize=max;}else if(wasAtEnd || liveRangeFollow){const windowSize=Math.max(1,oldWindow||60);rangeStart.value=Math.max(0,max-windowSize);rangeEnd.value=max;liveRangeFollow=true;rangeWindowSize=windowSize}else{rangeWindowSize=Math.max(1,rangeWindowSize||oldWindow||1);rangeStart.value=Math.min(Number(rangeStart.value),max);rangeEnd.value=Math.min(Math.max(Number(rangeEnd.value),Number(rangeStart.value)),max)}applyTimeRange()}catch(e){}}";
-  html += "function setCursorFromEvent(e){if(chartData.length<2)return;const r=e.currentTarget.getBoundingClientRect(),ratio=Math.max(0,Math.min(1,(e.clientX-r.left)/r.width));cursorIndex=Math.round(ratio*(chartData.length-1));renderCharts()}function bindChartCursors(){chartDefs.forEach(c=>{const el=$(c[0]+'Chart');el.addEventListener('pointermove',setCursorFromEvent);el.addEventListener('pointerdown',setCursorFromEvent);el.addEventListener('pointerleave',e=>{if(e.pointerType==='mouse'){cursorIndex=-1;renderCharts()}})})}";
-  html += "function esc(v){const d=document.createElement('div');d.textContent=v||'';return d.innerHTML}";
-  html += "function escAttr(v){return esc(v).replace(/'/g,'&#39;')}";
-  html += "function derived(t,h){const e=h/100*6.105*Math.exp(17.27*t/(237.7+t));const r=t+.33*e-4;const es=6.112*Math.exp(17.67*t/(t+243.5));const a=216.7*(es*h/100)/(273.15+t);return{r,a}}";
-  html += "let deleteTimer=null;function startDelete(id){cancelDelete();deleteTimer=setTimeout(()=>deleteSnapshot(id),900)}function cancelDelete(){if(deleteTimer){clearTimeout(deleteTimer);deleteTimer=null}}async function deleteSnapshot(id){cancelDelete();if(!confirm('Obrisati ovaj snapshot?'))return;const p=new URLSearchParams({id});const r=await fetch('/snapshot/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});message.textContent=r.ok?'Snapshot je obrisan.':'Brisanje nije uspelo.';await loadSnapshots()}";
-  html += "async function loadSnapshots(){const list=await fetch('/snapshots').then(r=>r.json());snapshots.innerHTML=list.map(s=>{const d=derived(s.temperature,s.humidity);return`<tr class='snapshotRow' onpointerdown='startDelete(${s.id})' onpointerup='cancelDelete()' onpointercancel='cancelDelete()' onpointerleave='cancelDelete()'><td>${esc(new Date(s.capturedAt).toLocaleString())}</td><td>${s.temperature.toFixed(2)} &deg;C</td><td>${s.humidity.toFixed(2)} %</td><td>${d.r.toFixed(2)} &deg;C</td><td>${d.a.toFixed(2)} g/m&sup3;</td><td><input maxlength='95' value='${escAttr(s.comment)}' onpointerdown='event.stopPropagation()' onchange='saveComment(${s.id},this.value)'></td></tr>`}).join('');}";
-  html += "let pendingSnapshot=null;async function captureSnapshot(){snapshotButton.disabled=true;message.textContent='Pravim snapshot...';await refresh();if(!live||!live.ahtReadingValid){message.textContent='Nema ispravnog ocitavanja.';snapshotButton.disabled=false;return;}pendingSnapshot={capturedAt:new Date().toISOString(),temperature:live.lastTemperature,humidity:live.lastHumidity,realFeel:live.lastRealFeel,absoluteHumidity:live.lastAbsoluteHumidity};temperatureSnapshot.textContent='snapshot: '+pendingSnapshot.temperature.toFixed(2)+' C';humiditySnapshot.textContent='snapshot: '+pendingSnapshot.humidity.toFixed(2)+' %';realFeelSnapshot.textContent='snapshot: '+pendingSnapshot.realFeel.toFixed(2)+' C';absoluteHumiditySnapshot.textContent='snapshot: '+pendingSnapshot.absoluteHumidity.toFixed(2)+' g/m3';saveSnapshotButton.classList.remove('hidden');snapshotButton.disabled=false;message.textContent='Snapshot je pripremljen. Klikni Sacuvaj snapshot.';}";
-  html += "async function savePendingSnapshot(){if(!pendingSnapshot)return;saveSnapshotButton.disabled=true;const s=pendingSnapshot,p=new URLSearchParams({capturedAt:s.capturedAt,t:s.temperature,h:s.humidity});const r=await fetch('/snapshot',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});message.textContent=r.ok?'Snapshot je trajno sacuvan.':'Cuvanje nije uspelo.';saveSnapshotButton.disabled=false;if(r.ok){pendingSnapshot=null;saveSnapshotButton.classList.add('hidden');temperatureSnapshot.textContent='';humiditySnapshot.textContent='';realFeelSnapshot.textContent='';absoluteHumiditySnapshot.textContent='';await loadSnapshots()}}";
-  html += "async function saveComment(id,comment){const p=new URLSearchParams({id,comment});await fetch('/snapshot/comment',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});message.textContent='Komentar je sacuvan.';}";
-  html += "let knownNetworkNames=[];async function loadNetwork(){try{const n=await fetch('/network/status',{cache:'no-store'}).then(r=>r.json());networkState.innerHTML=n.connected?`Povezano na <b>${esc(n.ssid)}</b><br>IP: <span class='address'>${esc(n.ip)}</span>`:`Fallback AP je aktivan: <b>${esc(n.apSsid)}</b><br>IP: <span class='address'>${esc(n.ip)}</span>`;knownNetworkNames=n.known;knownNetworks.innerHTML=n.known.length?n.known.map((s,i)=>`<div class='networkItem'><span>${esc(s)}</span><button class='danger' onclick='deleteNetworkByIndex(${i})'>Obrisi</button></div>`).join(''):`<span class='note'>Nema zapamcenih mreza.</span>`}catch(e){networkState.textContent='Status trenutno nije dostupan.'}}";
-  html += "async function scanNetworks(){networkMessage.textContent='Pretrazujem...';try{const list=await fetch('/network/scan',{cache:'no-store'}).then(r=>r.json()),seen=new Set();availableNetworks.innerHTML='';list.filter(n=>!seen.has(n.ssid)&&seen.add(n.ssid)).sort((a,b)=>b.rssi-a.rssi).forEach(n=>{const o=document.createElement('option');o.value=n.ssid;o.label=n.rssi+' dBm'+(n.secure?' · zakljucana':' · otvorena');availableNetworks.appendChild(o)});networkMessage.textContent=list.length?'Izaberi mrezu ili upisi skriveni SSID.':'Nijedna mreza nije pronadjena; SSID mozes uneti rucno.'}catch(e){networkMessage.textContent='Pretraga nije uspela.'}}";
-  html += "async function saveNetwork(){const ssid=networkSsid.value;if(!ssid){networkMessage.textContent='Prvo izaberi mrezu.';return}networkMessage.textContent='Cuvam mrezu...';const p=new URLSearchParams({ssid,password:networkPassword.value});try{const r=await fetch('/network/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p}),text=await r.text();networkMessage.textContent=r.ok?'Sacuvano. Telefon vrati na kucni Wi-Fi, pa otvori ws.local:8081':text;if(r.ok)networkPassword.value=''}catch(e){networkMessage.textContent='Veza je prekinuta radi povezivanja. Vrati telefon na kucni Wi-Fi i otvori ws.local:8081'}}";
-  html += "function deleteNetworkByIndex(i){if(i>=0&&i<knownNetworkNames.length)deleteNetwork(knownNetworkNames[i])}async function deleteNetwork(ssid){if(!confirm('Obrisati mrezu '+ssid+'?'))return;const p=new URLSearchParams({ssid});const r=await fetch('/network/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});networkMessage.textContent=await r.text();if(r.ok)await loadNetwork()}";
-  html += "function health(el,ok,text){el.className='debugValue '+(ok?'ok':'bad');el.textContent=text}async function loadDebug(){try{const [s,logs]=await Promise.all([fetch('/status',{cache:'no-store'}).then(r=>r.json()),fetch('/logs',{cache:'no-store'}).then(r=>r.text())]);health(debugSensor,s.ahtReadingValid,s.ahtReadingValid?'Radi · '+s.lastTemperature.toFixed(2)+' C / '+s.lastHumidity.toFixed(2)+' %':s.ahtPresent?'Pronadjen, bez validnog merenja':'Nije pronadjen');health(debugBattery,s.bqPresent&&s.bqReadHealthy,s.lastBatteryV>0?s.lastBatteryV.toFixed(2)+' V':'Nema merenja');debugBq.textContent=s.bqPresent?(s.bqReadHealthy?'BQ komunikacija je ispravna':'BQ greska pri citanju'):'BQ nije pronadjen';health(debugBle,true,s.bleConnected?'Klijent povezan':'Aktivan · nema klijenta');health(debugOta,s.webOtaActive,s.webOtaActive?'Aktivan · port 8080':'Nije aktivan');health(debugWifi,s.wifiRssi<0,s.wifiRssi<0?s.wifiRssi+' dBm':'Fallback AP');debugSystem.textContent=Math.round(s.freeHeap/1024)+' KB · '+Math.floor(s.uptimeSeconds/60)+' min · core '+s.appCore;diagnosticLedToggle.checked=s.ledsEnabled;debugLogs.textContent=logs||'Log je prazan.'}catch(e){debugMessage.textContent='Debug podaci nisu dostupni.'}}";
-  html += "async function setDiagnosticLeds(enabled){debugMessage.textContent='Cuvam...';const p=new URLSearchParams({enabled:enabled?'1':'0'});const r=await fetch('/debug/leds',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});debugMessage.textContent=r.ok?(enabled?'RGB dijagnostika je ukljucena.':'RGB dijagnostika je iskljucena.'):'Promena nije uspela.'}";
-  html += "bindChartCursors();setInterval(refresh,500);setInterval(refreshCharts,5000);refresh();refreshCharts();loadSnapshots();";
-  html += "</script></main></body></html>";
-  }
   debugServer.sendHeader("Cache-Control", "no-store");
-  debugServer.send(200, "text/html", html);
+  // send_P streams straight from flash; send() would copy the ~60KB dashboard into one heap
+  // buffer each request, which fails once the heap fragments (BLE/WiFi/SPIFFS activity) and
+  // was the cause of the dashboard going blank after a refresh.
+  debugServer.send_P(200, "text/html", dashboardHtml, sizeof(dashboardHtml) - 1);
 }
 
 void handleDebugLogs() {
@@ -906,9 +1044,9 @@ void handleDebugLogs() {
 }
 
 void handleDebugStatus() {
-  char json[900];
+  char json[950];
   snprintf(json, sizeof(json),
-           "{\"ahtPresent\":%s,\"ahtReadingValid\":%s,\"bqPresent\":%s,\"bqReadHealthy\":%s,\"lastTemperature\":%.3f,\"lastHumidity\":%.3f,\"lastRealFeel\":%.3f,\"lastAbsoluteHumidity\":%.3f,\"temperatureRate\":%.3f,\"humidityRate\":%.3f,\"realFeelRate\":%.3f,\"absoluteHumidityRate\":%.3f,\"lastBatteryV\":%.2f,\"intervalCitanjaMs\":%lu,\"i2cTimeoutMs\":%u,\"bqAdcDelayMs\":%u,\"bleConnected\":%s,\"webOtaActive\":%s,\"ledsEnabled\":%s,\"freeHeap\":%u,\"uptimeSeconds\":%lu,\"wifiRssi\":%ld,\"appCore\":%d}",
+           "{\"ahtPresent\":%s,\"ahtReadingValid\":%s,\"bqPresent\":%s,\"bqReadHealthy\":%s,\"lastTemperature\":%.3f,\"lastHumidity\":%.3f,\"lastRealFeel\":%.3f,\"lastAbsoluteHumidity\":%.3f,\"temperatureRate\":%.3f,\"humidityRate\":%.3f,\"realFeelRate\":%.3f,\"absoluteHumidityRate\":%.3f,\"lastBatteryV\":%.2f,\"intervalCitanjaMs\":%lu,\"i2cTimeoutMs\":%u,\"bqAdcDelayMs\":%u,\"bleConnected\":%s,\"webOtaActive\":%s,\"ledsEnabled\":%s,\"wifiEnabled\":%s,\"freeHeap\":%u,\"uptimeSeconds\":%lu,\"wifiRssi\":%ld,\"appCore\":%d}",
            ahtPresent ? "true" : "false",
            ahtReadingValid ? "true" : "false",
            bqPresent ? "true" : "false",
@@ -928,6 +1066,7 @@ void handleDebugStatus() {
            deviceConnected ? "true" : "false",
            otaServerActive ? "true" : "false",
            diagnosticLedsEnabled ? "true" : "false",
+           WiFi.getMode() != WIFI_OFF ? "true" : "false",
            ESP.getFreeHeap(),
            millis() / 1000,
            WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
@@ -1001,6 +1140,19 @@ void handleHistory() {
   json += ']';
   debugServer.sendHeader("Cache-Control", "no-store");
   debugServer.send(200, "application/json", json);
+}
+
+void handleHistoryInterpolate() {
+  uint32_t startEpoch = (uint32_t)strtoul(debugServer.arg("start").c_str(), nullptr, 10);
+  uint32_t endEpoch = (uint32_t)strtoul(debugServer.arg("end").c_str(), nullptr, 10);
+  if (startEpoch == 0 || endEpoch < startEpoch) {
+    debugServer.send(400, "text/plain", "Neispravan opseg.");
+    return;
+  }
+  uint32_t patched = 0;
+  bool ok = interpolatePersistentRange(startEpoch, endEpoch, patched);
+  debugServer.send(ok ? 200 : 500, "application/json",
+                   "{\"ok\":" + String(ok ? "true" : "false") + ",\"patched\":" + String(patched) + "}");
 }
 
 void appendJsonString(String &json, const char *value) {
@@ -1236,6 +1388,33 @@ void handleDiagnosticLedSet() {
   debugServer.send(200, "text/plain", "OK");
 }
 
+// Rucni prekidac: gasi/pali samo WiFi radio, debug/OTA server ostaje uvek pokrenut i cim WiFi
+// bude ponovo ukljucen postaje odmah dostupan bez ponovnog pokretanja.
+void setWifiEnabled(bool enabled) {
+  if (enabled) {
+    if (WiFi.getMode() == WIFI_OFF) {
+      networkReconfigurePending = true;
+      networkReconfigureAtMs = millis() + 200;
+      debugLogf("WiFi: rucno ukljucen preko prekidaca.");
+    }
+  } else {
+    if (WiFi.getMode() != WIFI_OFF) {
+      WiFi.mode(WIFI_OFF);
+      wifiApFallbackActive = false;
+      debugLogf("WiFi: rucno iskljucen preko prekidaca.");
+    }
+  }
+}
+
+void handleDebugWifiSet() {
+  if (!debugServer.hasArg("enabled")) {
+    debugServer.send(400, "text/plain", "Nedostaje enabled");
+    return;
+  }
+  setWifiEnabled(debugServer.arg("enabled") == "1");
+  debugServer.send(200, "text/plain", "OK");
+}
+
 void handleDebugSet() {
   if (debugServer.hasArg("interval")) {
     unsigned long v = (unsigned long)debugServer.arg("interval").toInt();
@@ -1264,7 +1443,7 @@ void handleDebugSet() {
 void setup() {
   delay(300);
   debugBuffer.reserve(DEBUG_BUFFER_MAX + 256);
-  dashboardHtml.reserve(27000);
+
   debugLogf("BOOT: VoiceToysWS pokrenut; UART je iskljucen.");
 
   setCpuFrequencyMhz(80);
@@ -1288,6 +1467,11 @@ void setup() {
                       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
                     );
 
+  pHistoryCharacteristic = pService->createCharacteristic(
+                      HISTORY_CHARACTERISTIC_UUID,
+                      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+                    );
+  pHistoryCharacteristic->setCallbacks(new MyHistoryCallbacks());
   pService->start();
 
   NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
@@ -1301,6 +1485,7 @@ void setup() {
   loadKnownNetworks();
   diagnosticLedsEnabled = wifiPreferences.getBool("diag-leds", true);
   initDiagnosticLeds();
+  startDiagnosticLedTask();
   startWebOtaServer();
   loadSnapshots();
   debugLogf("Snapshot memorija: %u/%u sacuvano.", snapshotStore.count, MAX_SNAPSHOTS);
@@ -1342,7 +1527,71 @@ void setup() {
   debugLogf("READY: inicijalizacija zavrsena; telemetrija na svakih %lu ms.", intervalCitanjaMs);
 }
 
+
+struct __attribute__((packed)) BleHistoryPoint {
+  uint32_t s;
+  int16_t t;
+  int16_t h;
+};
+
+// 2 points/notify (16 bytes) stays under the default 20-byte usable ATT MTU even before MTU negotiation completes.
+const uint8_t BLE_HISTORY_CHUNK_POINTS = 2;
+
 void loop() {
+  if (historyStreamActive && deviceConnected && historyStreamHeaderPending) {
+    // s=0xFFFFFFFE marks a header packet: t carries the expected point count (fits well under 32767).
+    BleHistoryPoint header = {0xFFFFFFFE, (int16_t)historyStreamExpectedPoints, 0};
+    pHistoryCharacteristic->setValue((uint8_t*)&header, sizeof(BleHistoryPoint));
+    pHistoryCharacteristic->notify();
+    historyStreamHeaderPending = false;
+  } else if (historyStreamActive && deviceConnected) {
+    BleHistoryPoint chunk[BLE_HISTORY_CHUNK_POINTS];
+    uint8_t chunkSize = 0;
+    
+    if (!historyStreamPersistent) {
+      uint16_t start = (historyHead + HISTORY_SIZE - historyCount) % HISTORY_SIZE;
+      while (chunkSize < BLE_HISTORY_CHUNK_POINTS && historyStreamIndex < historyStreamCount) {
+        const HistoryPoint &p = historyPoints[(start + historyStreamIndex) % HISTORY_SIZE];
+        chunk[chunkSize].s = p.seconds;
+        chunk[chunkSize].t = (int16_t)roundf(p.temperature * 100.0f);
+        chunk[chunkSize].h = (int16_t)roundf(p.humidity * 100.0f);
+        chunkSize++;
+        historyStreamIndex += historyStreamStride;
+      }
+    } else {
+      File file = SPIFFS.open(PERSISTENT_HISTORY_PATH, FILE_READ);
+      if (file) {
+        while (chunkSize < BLE_HISTORY_CHUNK_POINTS && historyStreamLogical < historyStreamCount) {
+          uint32_t physical = (historyStreamOldest + historyStreamLogical) % persistentHistory.capacity;
+          size_t offset = sizeof(PersistentHistoryHeader) + (size_t)physical * sizeof(PersistentHistoryPoint);
+          PersistentHistoryPoint p;
+          if (file.seek(offset, SeekSet) && file.read((uint8_t*)&p, sizeof(p)) == sizeof(p)) {
+            chunk[chunkSize].s = p.sequence;
+            chunk[chunkSize].t = p.temperature100;
+            chunk[chunkSize].h = p.humidity100;
+            chunkSize++;
+          }
+          historyStreamLogical += historyStreamStride;
+        }
+        file.close();
+      } else {
+        historyStreamActive = false; // abort if spiffs fail
+      }
+    }
+    
+    if (chunkSize > 0) {
+      pHistoryCharacteristic->setValue((uint8_t*)chunk, chunkSize * sizeof(BleHistoryPoint));
+      pHistoryCharacteristic->notify();
+    } else {
+      historyStreamActive = false;
+      // Send EOF packet
+      BleHistoryPoint eof = {0xFFFFFFFF, 0, 0};
+      pHistoryCharacteristic->setValue((uint8_t*)&eof, sizeof(BleHistoryPoint));
+      pHistoryCharacteristic->notify();
+      debugLogf("BLE History Stream zavrsen.");
+    }
+  }
+
   if (otaStartRequested) {
     otaStartRequested = false;
     startWebOtaServer();
@@ -1355,7 +1604,7 @@ void loop() {
     debugServer.handleClient();
   }
   updateClockState();
-  updateDiagnosticLeds();
+  // Diagnostic LEDs now run on their own dedicated core/task; see startDiagnosticLedTask().
 
   if (networkReconfigurePending && (long)(millis() - networkReconfigureAtMs) >= 0) {
     networkReconfigurePending = false;
@@ -1391,11 +1640,11 @@ void loop() {
       updateClimateMetrics(temperature, humidity);
     }
 
-    char asciiBuffer[64];
+    char asciiBuffer[80];
     if (ahtOk) {
-      snprintf(asciiBuffer, sizeof(asciiBuffer), "T:%.2f,H:%.2f,V:%.2fV", temperature, humidity, lastBatteryV);
+      snprintf(asciiBuffer, sizeof(asciiBuffer), "T:%.2f,H:%.2f,V:%.2fV,S:%lu", temperature, humidity, lastBatteryV, (unsigned long)currentSampleTimestamp());
     } else {
-      snprintf(asciiBuffer, sizeof(asciiBuffer), "T:NA,H:NA,V:%.2fV", lastBatteryV);
+      snprintf(asciiBuffer, sizeof(asciiBuffer), "T:NA,H:NA,V:%.2fV,S:%lu", lastBatteryV, (unsigned long)currentSampleTimestamp());
     }
 
     if (millis() - lastStatusLogMs >= 30000) {

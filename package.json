@@ -1,0 +1,21 @@
+{
+  "name": "htu21d",
+  "version": "1.0.0",
+  "description": "Arduino sketch for an ESP32-based temperature and humidity sensor node with BLE telemetry, persistent snapshots, web diagnostics, and WebOTA updates.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/doktordra/HTU21D.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/doktordra/HTU21D/issues"
+  },
+  "homepage": "https://github.com/doktordra/HTU21D#readme"
+}

@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">VoiceToysApp</string>
+    <string name="title_activity_main">VoiceToysApp</string>
+    <string name="package_name">com.voicetoys.app</string>
+    <string name="custom_url_scheme">com.voicetoys.app</string>
+</resources>
