@@ -1,4 +1,4 @@
-import { isNative, initBle, connectBle, sendCommand, requestHistory, interpolateHistory, sendTime, setWifiEnabled, deviceId } from './BleController.js';
+import { isNative, initBle, connectBle, sendCommand, requestHistory, interpolateHistory, sendTime, setWifiEnabled, deviceId, forceDisconnect } from './BleController.js';
 let live = null;
 const $ = (id) => document.getElementById(id);
 function setTrend(name, rate, scale, unit) {
@@ -84,19 +84,50 @@ let allChartData = [],
   dragStartRatio = null,      // Starts click-and-drag selection on canvas
   dragCurrentRatio = null;
 const SLIDER_MAX_POINTS = 600;
+// Poslednjih RECENT_SECONDS sekundi uvek ostaju na punoj rezoluciji (RECENT_BUDGET max tacaka);
+// stariji deo se downsampluje uniformno u OLD_BUDGET tacaka.
+// Na taj nacin brze promene u bliskoj proslosti ostaju vidljive na grafikonu,
+// dok se stara istorija kompresuje da stedri na prostoru.
+const RECENT_SECONDS = 7200;  // 2 sata punog detalja
+const RECENT_BUDGET  = 400;   // max tacaka za novi region
+const OLD_BUDGET     = 200;   // max tacaka za stari region
+
 function rebuildSliderData() {
-  // Cap the timeline/slider resolution so dragging always covers the full range in a handful of steps,
-  // regardless of how many raw points allChartData has accumulated locally.
   const src = allChartData;
-  if (src.length <= SLIDER_MAX_POINTS) {
-    sliderData = src;
-    return;
+  if (!src.length) { sliderData = src; return; }
+
+  // Uvek ukljuci poslednju tacku (najskorije ocitavanje)
+  const newestSec = src[src.length - 1].s;
+  const cutoff    = newestSec - RECENT_SECONDS;
+
+  // Nadji granicu (splitIdx) izmedju starog i novog dela
+  let splitIdx = 0;
+  for (let i = src.length - 1; i >= 0; i--) {
+    if (src[i].s <= cutoff) { splitIdx = i + 1; break; }
   }
-  const stride = Math.ceil(src.length / SLIDER_MAX_POINTS);
+
+  const oldSrc    = src.slice(0, splitIdx);
+  const recentSrc = src.slice(splitIdx);
   const out = [];
-  for (let i = 0; i < src.length; i += stride) out.push(src[i]);
-  const last = src[src.length - 1];
-  if (out[out.length - 1] !== last) out.push(last);
+
+  // Stari deo — uniformni downsampling
+  if (oldSrc.length > 0) {
+    const stride = oldSrc.length > OLD_BUDGET ? Math.ceil(oldSrc.length / OLD_BUDGET) : 1;
+    for (let i = 0; i < oldSrc.length; i += stride) out.push(oldSrc[i]);
+  }
+
+  // Novi deo — pun detalj ili blago komprimovan ako ima previse tacaka
+  if (recentSrc.length > 0) {
+    if (recentSrc.length <= RECENT_BUDGET) {
+      for (const p of recentSrc) out.push(p);
+    } else {
+      const stride = Math.ceil(recentSrc.length / RECENT_BUDGET);
+      for (let i = 0; i < recentSrc.length; i += stride) out.push(recentSrc[i]);
+      const last = recentSrc[recentSrc.length - 1];
+      if (out[out.length - 1] !== last) out.push(last);
+    }
+  }
+
   sliderData = out;
 }
 
@@ -760,11 +791,20 @@ function applyPinchZoom(scale, startRange, pivotRatio) {
 
 // One finger (or a hovering mouse) drives the vertical inspection guide; a mouse drag selects a
 // range to zoom into and two fingers pinch-zoom, all directly on the chart itself.
+//
+// PINCH ZOOM — two-anchor pristup:
+// Svaki prst "drzi" svoju vremensku tacku zakacenu za sebe tokom celog gesta.
+// Levi prst vuci levu granicu, desni prst vuci desnu granicu — nema zajednicke pivot tacke.
+// Matematika: znamo koje vreme je bilo pod levim (tL) i desnim (tR) prstom na pocetku pincha.
+// Na svakom move-u, ako je levi prst na ratio rL a desni na rR:
+//   newDuration = (tR - tL) / (rR - rL)
+//   newStartSec = tL - rL * newDuration
 function bindChartCursors() {
   const pointers = new Map();
-  let pinchStartDist = null,
-    pinchStartRange = null,
-    pinchPivotRatio = null;
+  // Cuva vremensku tacku (sekunde) koja je bila pod levim/desnim prstom pri pocetku pincha.
+  let pinchLeftStartSec  = null,
+      pinchRightStartSec = null,
+      pinchTarget        = null;
 
   const getXRatio = (clientX, target) => {
     const rect = target.getBoundingClientRect();
@@ -775,16 +815,23 @@ function bindChartCursors() {
     dragStartRatio = null;
     dragCurrentRatio = null;
     cursorIndex = -1;
+    pinchTarget = target;
     const pts = [...pointers.values()].slice(0, 2);
-    pinchStartDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-    pinchStartRange = { startSec: sliderData[sliderStart].s, endSec: sliderData[sliderEnd].s };
-    pinchPivotRatio = getXRatio((pts[0].x + pts[1].x) / 2, target);
+    // Sortiraj po X — pts[0] je levi prst, pts[1] je desni
+    const [lp, rp] = pts[0].x <= pts[1].x ? [pts[0], pts[1]] : [pts[1], pts[0]];
+    const startSec   = sliderData[sliderStart].s;
+    const duration   = sliderData[sliderEnd].s - startSec;
+    const leftRatio  = getXRatio(lp.x, target);
+    const rightRatio = getXRatio(rp.x, target);
+    // Spremi tacne vremenske tacke pod svakim prstom
+    pinchLeftStartSec  = startSec + leftRatio  * duration;
+    pinchRightStartSec = startSec + rightRatio * duration;
   };
 
   const endPinch = () => {
-    pinchStartDist = null;
-    pinchStartRange = null;
-    pinchPivotRatio = null;
+    pinchLeftStartSec  = null;
+    pinchRightStartSec = null;
+    pinchTarget        = null;
   };
 
   // Applies the horizontal selection made on a chart as the new zoom range.
@@ -837,10 +884,30 @@ function bindChartCursors() {
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     }
 
-    if (pointers.size >= 2 && pinchStartDist && pinchStartRange && pinchPivotRatio !== null) {
+    if (pointers.size >= 2 && pinchLeftStartSec !== null && pinchRightStartSec !== null && pinchTarget) {
       const pts = [...pointers.values()].slice(0, 2);
-      const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-      applyPinchZoom(pinchStartDist / Math.max(1, dist), pinchStartRange, pinchPivotRatio);
+      // Sortiraj po X da bi levi/desni prst odgovarao levoj/desnoj vremenskoj tacki
+      const [lp, rp] = pts[0].x <= pts[1].x ? [pts[0], pts[1]] : [pts[1], pts[0]];
+      const lRatio = getXRatio(lp.x, pinchTarget);
+      const rRatio = getXRatio(rp.x, pinchTarget);
+      const spread = rRatio - lRatio;
+
+      // Minimlani spread da se izbegne deljenje nulom / preterano zumiranje
+      if (spread < 0.02) return;
+
+      // Izracunaj novi vremenski opseg tako da levi prst ostaje na pinchLeftStartSec
+      // a desni prst ostaje na pinchRightStartSec
+      const rawDuration  = (pinchRightStartSec - pinchLeftStartSec) / spread;
+      const newDuration  = clamp(Math.round(rawDuration), 120, 86400 * 7);
+      const newStartSec  = pinchLeftStartSec - lRatio * newDuration;
+      const newEndSec    = newStartSec + newDuration;
+
+      const n      = sliderData.length;
+      const minGap = Math.max(1, Math.round(n * 0.02));
+      sliderStart  = nearestIndex(sliderData, newStartSec);
+      sliderEnd    = nearestIndex(sliderData, newEndSec);
+      if (sliderEnd - sliderStart < minGap) sliderEnd = Math.min(n - 1, sliderStart + minGap);
+      applyTimeRange(true);
       return;
     }
 
@@ -1345,11 +1412,37 @@ if (isNative) {
   setInterval(() => {
     if (!deviceId) attemptConnect(false);
   }, 4000);
+
   // Sync ide u pozadini samo kad zivi podaci prestanu da sticu (znaci da nesto nedostaje), ne na svakih par sekundi.
   let lastLiveUpdateAt = Date.now();
   setInterval(() => {
     if (deviceId && Date.now() - lastLiveUpdateAt > 5000) requestHistorySync();
   }, 5000);
+
+  // Watchdog: ako je deviceId setovan ali live paketi nisu stigli duze od 10s,
+  // BLE stack je tiho pao (bez disconnect callbacka). Prisilno resetuj konekciju
+  // da auto-reconnect loop moze da ponovo pokuša.
+  setInterval(async () => {
+    if (deviceId && Date.now() - lastLiveUpdateAt > 10000) {
+      console.warn('BLE watchdog: nema live podataka 10s, prisilno diskonekcija...');
+      sensorState.textContent = 'Veza prekinuta. Tražim ponovo...';
+      await forceDisconnect();
+      // deviceId je sada null — sledeci obrtaj auto-reconnect intervala ce ga pokupiti
+    }
+  }, 5000);
+
+  // Periodično ažuriraj sensorState dok je BLE aktivan, da ghost poruka
+  // ne ostane zauvek na ekranu ako ocitavanja kasne ili stanu.
+  setInterval(() => {
+    if (!isNative) return;
+    if (!deviceId) {
+      // Nije povezan — attemptConnect ce ažurirati poruku sam;
+      // samo osiguraj da nema zaostalih "aktivan" poruka.
+      if (!connecting) sensorState.textContent = 'Tražim VoiceToysWS uređaj u blizini...';
+    } else if (Date.now() - lastLiveUpdateAt > 3000) {
+      sensorState.textContent = 'BLE povezan · čekam očitavanje senzora...';
+    }
+  }, 2000);
 
   let syncTotal = 0,
     syncReceived = 0,

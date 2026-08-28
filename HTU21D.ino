@@ -41,6 +41,9 @@ bool historyStreamPersistent = false;
 uint32_t historyStreamCount = 0;
 bool historyStreamHeaderPending = false;
 uint32_t historyStreamExpectedPoints = 0;
+// Logicki indeks od kojeg pocinje "noviji" region (stride=1, pun detalj).
+// Sve sto je ispod ovog indeksa ce biti downsampled historyStreamStride-om.
+uint32_t historyStreamRecentStart = 0;
 
 
 bool deviceConnected = false;
@@ -579,7 +582,13 @@ class MyHistoryCallbacks: public NimBLECharacteristicCallbacks {
       historyStreamActive = true;
       historyStreamIndex = 0;
       historyStreamLogical = 0;
+      historyStreamRecentStart = 0;
       uint32_t remainingPoints = 0;
+
+      // Tacke u poslednjih RECENT_FULL_RES_SECONDS sekundi uvek idu na punoj rezoluciji.
+      // Stariji podaci se downsampluju da ukupni broj prenetih tacaka ostane razuman.
+      const uint32_t RECENT_FULL_RES_SECONDS = 7200; // 2 sata
+      const uint32_t OLD_MAX_POINTS          = 400;  // max tacaka za stari region
 
       if (!persistentHistoryReady || persistentHistory.count == 0) {
         historyStreamPersistent = false;
@@ -593,7 +602,9 @@ class MyHistoryCallbacks: public NimBLECharacteristicCallbacks {
         }
         historyStreamIndex = skip;
         remainingPoints = historyCount - skip;
-        historyStreamStride = remainingPoints > 600 ? (remainingPoints + 599) / 600 : 1;
+        // RAM istorija je max 10 minuta — uvek je "nova", nema potrebbe za downsampling.
+        historyStreamStride = 1;
+        historyStreamRecentStart = skip; // sve je recent
       } else {
         historyStreamPersistent = true;
         historyStreamOldest = (persistentHistory.head + persistentHistory.capacity - persistentHistory.count) % persistentHistory.capacity;
@@ -601,15 +612,35 @@ class MyHistoryCallbacks: public NimBLECharacteristicCallbacks {
           ? findPersistentSkipCount(sinceEpoch, historyStreamOldest, persistentHistory.count)
           : (persistentHistory.count > rangeSeconds ? persistentHistory.count - rangeSeconds : 0);
         uint32_t req = persistentHistory.count - skip;
-        historyStreamStride = req > 600 ? (req + 599) / 600 : 1;
+        remainingPoints = req;
+
+        // Izracunaj gde pocinje "novi" region (poslednjih RECENT_FULL_RES_SECONDS sekundi).
+        // Trajnna istorija je na 1 Hz, pa broj tacaka == sekunde trajanja.
+        uint32_t recentPointCount = min((uint32_t)RECENT_FULL_RES_SECONDS, persistentHistory.count);
+        uint32_t recentStartLogical = persistentHistory.count > recentPointCount
+                                    ? persistentHistory.count - recentPointCount
+                                    : 0;
+        // Ako je skip veci od recentStartLogical, sve preostale tacke su vec "nove".
+        historyStreamRecentStart = recentStartLogical > skip ? recentStartLogical : skip;
+
+        uint32_t oldCount = historyStreamRecentStart - skip;
+        uint32_t recentCount = persistentHistory.count - historyStreamRecentStart;
+
+        // Stride se primenjuje samo na stari region.
+        historyStreamStride = oldCount > OLD_MAX_POINTS ? (oldCount + OLD_MAX_POINTS - 1) / OLD_MAX_POINTS : 1;
+
         historyStreamLogical = skip;
         historyStreamCount = persistentHistory.count;
-        remainingPoints = req;
+
+        // Ocekivani broj tacaka = downsampled stari deo + pun novi deo
+        uint32_t sampledOld = historyStreamStride > 0 ? (oldCount + historyStreamStride - 1) / historyStreamStride : 0;
+        remainingPoints = sampledOld + recentCount;
       }
 
-      historyStreamExpectedPoints = historyStreamStride == 0 ? 0 : (remainingPoints + historyStreamStride - 1) / historyStreamStride;
+      historyStreamExpectedPoints = remainingPoints;
       historyStreamHeaderPending = true;
-      debugLogf("BLE History Stream pokrenut (since=%lu, %lu novih tacaka).", sinceEpoch, remainingPoints);
+      debugLogf("BLE History Stream pokrenut (since=%lu, %lu tacaka, stride=%lu, recentStart=%lu).",
+                sinceEpoch, historyStreamExpectedPoints, historyStreamStride, historyStreamRecentStart);
     }
   }
 };
@@ -1571,7 +1602,9 @@ void loop() {
             chunk[chunkSize].h = p.humidity100;
             chunkSize++;
           }
-          historyStreamLogical += historyStreamStride;
+          // Koristiti stride=1 (pun detalj) za novi region; stride za stari region.
+          uint32_t step = (historyStreamLogical < historyStreamRecentStart) ? historyStreamStride : 1;
+          historyStreamLogical += step;
         }
         file.close();
       } else {

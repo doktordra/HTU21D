@@ -71,6 +71,21 @@ export async function connectBle() {
   }
 }
 
+// Prisilno gasi aktivnu BLE konekciju i resetuje deviceId.
+// Poziva se iz watchdoga u main.js kada live paketi prestanu da stižu
+// a deviceId je i dalje setovan (tihi pad BLE steka).
+export async function forceDisconnect() {
+  if (!deviceId) return;
+  const id = deviceId;
+  deviceId = null; // resetuj odmah da auto-reconnect može da krene
+  try {
+    await BleClient.disconnect(id);
+  } catch (e) {
+    // Ignorisati — konekcija je verovatno već mrtva
+    console.warn('forceDisconnect: BleClient.disconnect bacio grešku (očekivano ako je veza već pala):', e);
+  }
+}
+
 export async function sendCommand(char) {
   if (!deviceId) return;
   await BleClient.write(deviceId, SERVICE_UUID, LIVE_UUID, numbersToDataView([char.charCodeAt(0)]));
