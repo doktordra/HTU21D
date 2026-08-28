@@ -44,6 +44,8 @@ uint32_t historyStreamExpectedPoints = 0;
 // Logicki indeks od kojeg pocinje "noviji" region (stride=1, pun detalj).
 // Sve sto je ispod ovog indeksa ce biti downsampled historyStreamStride-om.
 uint32_t historyStreamRecentStart = 0;
+// Drzimo fajl otvoren tokom celog stream-a umesto da ga otvaramo/zatvaramo na svaka 2 poena.
+File historyStreamFile;
 
 
 bool deviceConnected = false;
@@ -160,11 +162,13 @@ uint16_t historyHead = 0;
 
 // Trajna istorija: 1 s rezolucija, kruzno do 24 sata (~1 MB).
 // Poslednjih 10 minuta ostaje u RAM-u na punih 500 ms.
-// Flash se ne pise svake sekunde: 60 tacaka se upisuje odjednom na minut.
+// Flash se ne pise svake sekunde: tacke se nakupljaju i upisuju odjednom.
 const uint32_t PERSISTENT_HISTORY_MAGIC = 0x434C494D;
 const uint16_t PERSISTENT_HISTORY_VERSION = 4;
 const uint32_t PERSISTENT_HISTORY_CAPACITY = 24UL * 60UL * 60UL;
-const uint16_t PERSISTENT_BATCH_SIZE = 60;
+// Dovoljno veliko da pokrije i najduzi BLE history stream (fajl je zauzet za citanje dok stream traje,
+// pa se upis odlaze do kraja stream-a — vidi flushPersistentHistoryBatch/historyStreamActive guard).
+const uint16_t PERSISTENT_BATCH_SIZE = 1800;
 const char PERSISTENT_HISTORY_PATH[] = "/climate-history.bin";
 
 struct PersistentHistoryHeader {
@@ -328,6 +332,9 @@ bool initPersistentHistory() {
 
 bool flushPersistentHistoryBatch() {
   if (!persistentHistoryReady || persistentBatchCount == 0) return true;
+  // Ne otvaraj drugi handle dok BLE stream drzi fajl otvoren za citanje (SPIFFS ne podnosi dobro
+  // dva istovremena handle-a na istom fajlu); sacekaj da se stream zavrsi, uzorci ostaju u RAM batch-u.
+  if (historyStreamActive) return false;
 
   File file = SPIFFS.open(PERSISTENT_HISTORY_PATH, "r+");
   if (!file) return false;
@@ -606,6 +613,8 @@ class MyHistoryCallbacks: public NimBLECharacteristicCallbacks {
         historyStreamStride = 1;
         historyStreamRecentStart = skip; // sve je recent
       } else {
+        if (historyStreamFile) historyStreamFile.close();
+        historyStreamFile = SPIFFS.open(PERSISTENT_HISTORY_PATH, FILE_READ);
         historyStreamPersistent = true;
         historyStreamOldest = (persistentHistory.head + persistentHistory.capacity - persistentHistory.count) % persistentHistory.capacity;
         uint32_t skip = sinceEpoch > 0
@@ -657,6 +666,7 @@ class MyServerCallbacks: public NimBLEServerCallbacks {
     deviceConnected = false;
     historyStreamActive = false;
     historyStreamHeaderPending = false;
+    if (historyStreamFile) historyStreamFile.close();
     debugLogf("Klijent otkacen. Ponovno oglasavanje...");
     pServer->getAdvertising()->start();
   }
@@ -1590,13 +1600,13 @@ void loop() {
         historyStreamIndex += historyStreamStride;
       }
     } else {
-      File file = SPIFFS.open(PERSISTENT_HISTORY_PATH, FILE_READ);
-      if (file) {
+      // Fajl se otvara jednom kad stream krene (vidi onWrite 'G') i ostaje otvoren do kraja/prekida.
+      if (historyStreamFile) {
         while (chunkSize < BLE_HISTORY_CHUNK_POINTS && historyStreamLogical < historyStreamCount) {
           uint32_t physical = (historyStreamOldest + historyStreamLogical) % persistentHistory.capacity;
           size_t offset = sizeof(PersistentHistoryHeader) + (size_t)physical * sizeof(PersistentHistoryPoint);
           PersistentHistoryPoint p;
-          if (file.seek(offset, SeekSet) && file.read((uint8_t*)&p, sizeof(p)) == sizeof(p)) {
+          if (historyStreamFile.seek(offset, SeekSet) && historyStreamFile.read((uint8_t*)&p, sizeof(p)) == sizeof(p)) {
             chunk[chunkSize].s = p.sequence;
             chunk[chunkSize].t = p.temperature100;
             chunk[chunkSize].h = p.humidity100;
@@ -1606,7 +1616,6 @@ void loop() {
           uint32_t step = (historyStreamLogical < historyStreamRecentStart) ? historyStreamStride : 1;
           historyStreamLogical += step;
         }
-        file.close();
       } else {
         historyStreamActive = false; // abort if spiffs fail
       }
@@ -1615,8 +1624,12 @@ void loop() {
     if (chunkSize > 0) {
       pHistoryCharacteristic->setValue((uint8_t*)chunk, chunkSize * sizeof(BleHistoryPoint));
       pHistoryCharacteristic->notify();
+      // Daj BLE steku vremena da isprazni notifikaciju pre sledece; salju se prebrzo bez ove pauze
+      // (brze od pregovorenog konekcionog intervala od 30-50ms) sto vremenom prepuni NimBLE red i obara uredjaj.
+      delay(30);
     } else {
       historyStreamActive = false;
+      if (historyStreamFile) historyStreamFile.close();
       // Send EOF packet
       BleHistoryPoint eof = {0xFFFFFFFF, 0, 0};
       pHistoryCharacteristic->setValue((uint8_t*)&eof, sizeof(BleHistoryPoint));

@@ -149,7 +149,10 @@ function interpolateOutliers(data) {
   }
 
   // Vise-prolazni detektor: 3 uzastopna prolaza da bi se ulovili i susedni/vezani spajkovi.
-  // Koristi najblize validne levo/desno tacke bez obzira na vremensko rastojanje (radi i za downsamplovanu istoriju).
+  // Koristi najblize validne levo/desno tacke, ali samo ako su vremenski blizu — veliki razmak
+  // (npr. period dok telefon nije bio povezan preko BLE) znaci da je promena verovatno stvarna,
+  // ne senzorski glič, pa se preskace da se ne bi lazno "izravnala" prava izmerena promena.
+  const MAX_NEIGHBOR_GAP_SEC = 600;
   for (let pass = 0; pass < 3; pass++) {
     for (let i = 1; i < data.length - 1; i++) {
       if (isBad[i]) continue;
@@ -163,6 +166,7 @@ function interpolateOutliers(data) {
         const p = data[i];
         const prev = data[leftIdx];
         const next = data[rightIdx];
+        if (p.s - prev.s > MAX_NEIGHBOR_GAP_SEC || next.s - p.s > MAX_NEIGHBOR_GAP_SEC) continue;
         
         const diffT1 = p.t - prev.t;
         const diffT2 = p.t - next.t;
